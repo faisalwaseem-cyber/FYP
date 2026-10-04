@@ -49,7 +49,7 @@ class CourierAPIError(RuntimeError):
     code : str
         Provider-specific error code string.
     provider : str
-        Name of the courier provider (e.g. 'postex', 'trax').
+        Name of the configured courier provider.
     """
 
     def __init__(self, code: str, message: str, provider: str = ""):

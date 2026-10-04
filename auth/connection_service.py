@@ -158,6 +158,56 @@ def create_or_update_connection(
         return connection_id
 
 
+def setup_jazzcash_sandbox_connection(
+    *,
+    business_id: int,
+    merchant_id: str,
+    password: str,
+    integrity_salt: str,
+) -> int:
+    """Store JazzCash Sandbox credentials for a server-resolved business."""
+    if (
+        not isinstance(business_id, int)
+        or isinstance(business_id, bool)
+        or business_id <= 0
+    ):
+        raise ValueError("business_id must be a positive server-resolved integer.")
+
+    credentials = {
+        "merchant_id": merchant_id,
+        "password": password,
+        "integrity_salt": integrity_salt,
+    }
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in credentials.values()
+    ):
+        raise ValueError("JazzCash credentials must be non-empty strings.")
+
+    connection_id = create_or_update_connection(
+        business_id=business_id,
+        platform="jazzcash",
+        platform_category="payment",
+        account_identifier="sandbox",
+        account_name="JazzCash Sandbox",
+        auth_type="credentials",
+        additional_credentials=credentials,
+    )
+
+    # Import locally to avoid a module cycle: CredentialManager also uses this
+    # service for token updates.
+    from auth.credential_manager import CredentialManager
+
+    stored_credentials = CredentialManager().get_valid_credentials(
+        business_id=business_id,
+        platform="jazzcash",
+        account_identifier="sandbox",
+    ).get("additional_credentials")
+    if stored_credentials != credentials:
+        raise RuntimeError("JazzCash credentials could not be verified after storage.")
+    return connection_id
+
+
 def get_connection(
     business_id: int,
     platform: str,

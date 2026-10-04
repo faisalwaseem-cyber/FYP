@@ -82,13 +82,13 @@ class TestPhase71Standardization(unittest.TestCase):
         self.assertEqual(row["impressions"], 9007199254740993)
 
     def test_courier_and_payment_emit_decimal_and_aware_timestamp_values(self):
-        shipment = CourierTransformer(1).transform_shipment("postex", {
-            "trackingNumber": "TN-1",
-            "orderRefNumber": "1001",
-            "orderStatus": "Delivered",
-            "deliveryCharges": "125.40",
-            "bookingDate": "2026-10-01T12:00:00+05:00",
-            "deliveryDate": "2026-10-01T16:00:00+05:00",
+        shipment = CourierTransformer(1).transform_shipment("custom_courier", {
+            "tracking_number": "TN-1",
+            "external_order_id": "1001",
+            "status": "Delivered",
+            "shipping_cost": "125.40",
+            "shipped_at": "2026-10-01T12:00:00+05:00",
+            "delivery_date": "2026-10-01T16:00:00+05:00",
         })
         self.assertIsInstance(shipment["shipping_cost"], Decimal)
         self.assertEqual(shipment["shipped_at"], datetime(2026, 10, 1, 7, 0, tzinfo=timezone.utc))

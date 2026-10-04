@@ -170,25 +170,13 @@ class PaymentTransformer:
         return self.transform_payment_records(records, order_map, original_payment_map)
 
 
-def transform_stripe_charges(
-    charges: List[Dict[str, Any]],
-    external_order_id_map: Dict[str, int],
-    business_id: int,
-) -> pd.DataFrame:
-    return PaymentTransformer(business_id).transform_provider_data(
-        "stripe", charges, external_order_id_map
-    )
-
-
 def transform_csv_payments(
     raw_records: List[Dict[str, Any]],
     external_order_id_map: Dict[str, int],
     business_id: int,
     gateway_name: str = "manual",
 ) -> pd.DataFrame:
-    provider_name = gateway_name if gateway_name in (
-        "payfast", "easypaisa", "jazzcash", "cod", "stripe"
-    ) else "manual"
+    provider_name = gateway_name if gateway_name in ("jazzcash", "cod") else "manual"
     return PaymentTransformer(business_id).transform_provider_data(
         provider_name, raw_records, external_order_id_map
     )

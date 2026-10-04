@@ -661,7 +661,7 @@ ON core.oauth_state (state_nonce, platform);
 CREATE TABLE IF NOT EXISTS core.platform_connection (
     connection_id                     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     business_id                       BIGINT NOT NULL REFERENCES core.business (business_id) ON DELETE CASCADE,
-    platform                          TEXT NOT NULL,          -- 'shopify' | 'daraz' | 'meta' | 'postex' | 'trax' | ...
+    platform                          TEXT NOT NULL,          -- Legacy provider values may remain in rows; active scope is application-managed.
     platform_category                 TEXT NOT NULL,          -- 'ecommerce' | 'marketing' | 'courier' | 'payment'
     account_identifier                TEXT NOT NULL,          -- store domain, seller ID, ad account ID, etc.
     account_name                      TEXT,

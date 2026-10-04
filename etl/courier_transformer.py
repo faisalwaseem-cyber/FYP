@@ -2,8 +2,8 @@
 Courier ETL Transformer — BRIDGE FLOW Phase 5.3
 ================================================
 
-Transforms raw courier API responses (PostEx, Trax, Leopards or any dict-based
-payload) into the canonical shipment and RTO record structures that the
+Transforms generic courier payloads into the canonical shipment and RTO
+record structures that the
 CourierLoader writes to the database.
 
 Schema mapping (verified against ecommerce_intelligence_schema.sql)
@@ -170,116 +170,6 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Provider-specific field extraction helpers
-# ---------------------------------------------------------------------------
-
-def _extract_postex_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts fields from a PostEx tracking API response.
-
-    PostEx wraps data under a 'dist' key:
-      {
-        "statusCode": "200",
-        "dist": {
-          "trackingNumber": "...",
-          "orderRefNumber": "...",
-          "orderStatus": "...",
-          "deliveryCharges": 250.0,
-          "orderAmount": 4250.0,
-          "attemptCount": 1,
-          "bookingDate": "2026-09-29T11:00:00+05:00",
-          "deliveryDate": "2026-09-29T16:30:00+05:00"
-        }
-      }
-    Callers may also pass the unwrapped 'dist' dict directly.
-    """
-    dist = payload.get("dist") if isinstance(payload.get("dist"), dict) else payload
-    return {
-        "tracking_number":   str(dist.get("trackingNumber") or dist.get("tracking_number") or "").strip(),
-        "external_order_id": str(dist.get("orderRefNumber") or dist.get("external_order_id") or dist.get("order_id") or "").strip(),
-        "raw_status":        dist.get("orderStatus") or dist.get("status") or dist.get("transactionStatus"),
-        "shipping_cost":     _parse_money(dist.get("deliveryCharges") or dist.get("shipping_cost")),
-        "cod_amount":        _parse_money(dist.get("orderAmount") or dist.get("cod_amount") or dist.get("invoicePayment")),
-        "delivery_attempts": _parse_int_non_negative(dist.get("attemptCount") or dist.get("delivery_attempts")),
-        "shipped_at":        _parse_timestamp(dist.get("bookingDate") or dist.get("shipped_at")),
-        "delivered_at":      _parse_timestamp(dist.get("deliveryDate") or dist.get("delivered_at")),
-    }
-
-
-def _extract_trax_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts fields from a Trax Pakistan tracking API response.
-
-      {
-        "cn": "TRAX-001-PK",
-        "reference": "ORD-12345",
-        "current_status": "Delivered",
-        "charges": 180.0,
-        "cod_amount": 3000.0,
-        "attempts": 1,
-        "pickup_date": "...",
-        "delivery_date": "..."
-      }
-    """
-    return {
-        "tracking_number":   str(payload.get("cn") or payload.get("tracking_number") or "").strip(),
-        "external_order_id": str(payload.get("reference") or payload.get("order_reference") or payload.get("external_order_id") or "").strip(),
-        "raw_status":        payload.get("current_status") or payload.get("status"),
-        "shipping_cost":     _parse_money(payload.get("charges") or payload.get("shipping_cost") or payload.get("freight")),
-        "cod_amount":        _parse_money(payload.get("cod_amount") or payload.get("amount")),
-        "delivery_attempts": _parse_int_non_negative(payload.get("attempts") or payload.get("delivery_attempts")),
-        "shipped_at":        _parse_timestamp(payload.get("pickup_date") or payload.get("shipped_at")),
-        "delivered_at":      _parse_timestamp(payload.get("delivery_date") or payload.get("delivered_at")),
-    }
-
-
-def _extract_leopards_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts fields from a Leopards Courier API response.
-
-    Leopards wraps tracking data under 'packet_list':
-      {
-        "status": 1,
-        "packet_list": [{
-          "booked_packet_cn": "LEP-9001",
-          "booked_packet_order_id": "ORD-789",
-          "booked_packet_status": "Delivered",
-          "booked_packet_vol_weight_lbs": "...",
-          "booked_packet_collect_amount": "2500",
-          "booked_packet_no_of_attempts": "2",
-          "cn_date": "...",
-          "cn_delivered_date": "..."
-        }]
-      }
-    Callers may also pass the packet dict directly.
-    """
-    # Unwrap packet_list if present
-    if "packet_list" in payload and isinstance(payload["packet_list"], list):
-        packet = payload["packet_list"][0] if payload["packet_list"] else {}
-    else:
-        packet = payload
-
-    return {
-        "tracking_number":   str(packet.get("booked_packet_cn") or packet.get("tracking_number") or "").strip(),
-        "external_order_id": str(packet.get("booked_packet_order_id") or packet.get("order_id") or packet.get("external_order_id") or "").strip(),
-        "raw_status":        packet.get("booked_packet_status") or packet.get("status"),
-        "shipping_cost":     _parse_money(packet.get("booked_packet_freight") or packet.get("shipping_cost")),
-        "cod_amount":        _parse_money(packet.get("booked_packet_collect_amount") or packet.get("cod_amount")),
-        "delivery_attempts": _parse_int_non_negative(packet.get("booked_packet_no_of_attempts") or packet.get("delivery_attempts")),
-        "shipped_at":        _parse_timestamp(packet.get("cn_date") or packet.get("shipped_at")),
-        "delivered_at":      _parse_timestamp(packet.get("cn_delivered_date") or packet.get("delivered_at")),
-    }
-
-
-# Registry: provider_name → extraction function
-_PROVIDER_EXTRACTORS = {
-    "postex":   _extract_postex_fields,
-    "trax":     _extract_trax_fields,
-    "leopards": _extract_leopards_fields,
-}
-
-
-# ---------------------------------------------------------------------------
 # Main transformer class
 # ---------------------------------------------------------------------------
 
@@ -321,8 +211,7 @@ class CourierTransformer:
         Parameters
         ----------
         courier_name : str
-            Provider name: 'postex', 'trax', 'leopards', or any custom name.
-            Stored normalised (lowercase) in core.courier.courier_name.
+            Provider identifier stored lowercased in core.courier.courier_name.
         payload : dict
             Raw API response dict from the courier client.
         source_platform : str
@@ -350,12 +239,7 @@ class CourierTransformer:
         """
         provider = courier_name.strip().lower()
 
-        extractor = _PROVIDER_EXTRACTORS.get(provider)
-        if extractor is not None:
-            fields = extractor(payload)
-        else:
-            # Generic fallback: try common field names from any provider
-            fields = self._extract_generic_fields(payload)
+        fields = self._extract_generic_fields(payload)
 
         # Honour caller-supplied overrides (allow pipelines to inject
         # external_order_id from the database query context)
@@ -502,10 +386,9 @@ class CourierTransformer:
         for rec in records:
             # Provider-agnostic field extraction for COD settlement
             tracking = str(
-                rec.get("trackingNumber")
-                or rec.get("booked_packet_cn")
+                rec.get("tracking_number")
+                or rec.get("trackingNumber")
                 or rec.get("cn")
-                or rec.get("tracking_number")
                 or ""
             ).strip()
 
@@ -513,16 +396,13 @@ class CourierTransformer:
                 continue  # Skip incomplete records
 
             cod = _parse_money(
-                rec.get("orderAmount")
-                or rec.get("booked_packet_collect_amount")
+                rec.get("cod_amount")
                 or rec.get("amount")
-                or rec.get("cod_amount")
             )
 
             settlement_date = _parse_timestamp(
-                rec.get("settlementDate")
+                rec.get("settlement_date")
                 or rec.get("settled_date")
-                or rec.get("settlement_date")
             )
 
             result.append({
@@ -542,8 +422,7 @@ class CourierTransformer:
     @staticmethod
     def _extract_generic_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Generic field extraction for unregistered providers.
-        Tries all known field aliases in priority order.
+        Extract common courier fields without provider-specific mappings.
         """
         return {
             "tracking_number": str(
@@ -554,43 +433,34 @@ class CourierTransformer:
             ).strip(),
             "external_order_id": str(
                 payload.get("external_order_id")
-                or payload.get("orderRefNumber")
                 or payload.get("order_id")
                 or payload.get("reference")
                 or ""
             ).strip(),
             "raw_status": (
                 payload.get("status")
-                or payload.get("orderStatus")
                 or payload.get("current_status")
-                or payload.get("transactionStatus")
                 or payload.get("shipment_status")
             ),
             "shipping_cost": _parse_money(
                 payload.get("shipping_cost")
-                or payload.get("deliveryCharges")
                 or payload.get("charges")
                 or payload.get("freight")
             ),
             "cod_amount": _parse_money(
                 payload.get("cod_amount")
-                or payload.get("orderAmount")
                 or payload.get("amount")
-                or payload.get("invoicePayment")
             ),
             "delivery_attempts": _parse_int_non_negative(
                 payload.get("delivery_attempts")
-                or payload.get("attemptCount")
                 or payload.get("attempts")
             ),
             "shipped_at": _parse_timestamp(
                 payload.get("shipped_at")
-                or payload.get("bookingDate")
                 or payload.get("pickup_date")
             ),
             "delivered_at": _parse_timestamp(
                 payload.get("delivered_at")
-                or payload.get("deliveryDate")
                 or payload.get("delivery_date")
             ),
         }

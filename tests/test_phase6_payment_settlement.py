@@ -15,20 +15,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.database import get_db_connection
 from connectors.payment import (
     CODReconciliationProvider,
-    EasyPaisaPaymentProvider,
     JazzCashPaymentProvider,
     ManualPaymentProvider,
     PaymentRecord,
     PaymentSettlement,
     PaymentSettlementEntry,
-    StripePaymentProvider,
-    normalize_method,
     normalize_status,
 )
 from connectors.payment.provider_factory import get_payment_provider
 from etl.payment_transformer import PaymentTransformer
 from loaders.payment_loader import PaymentLoader
-from pipeline.run_payment_sync import run_payment_sync, run_stripe_sync
+from pipeline.run_payment_sync import run_payment_sync
 
 
 class TestPhase6PaymentSettlement(unittest.TestCase):
@@ -185,29 +182,9 @@ class TestPhase6PaymentSettlement(unittest.TestCase):
         return PaymentLoader(business_id).get_payment_id_map()[external_id]
 
     def test_provider_parsers_do_not_infer_canonical_transaction_fields(self):
-        stripe = StripePaymentProvider().parse_transactions([{
-            "object": "charge",
-            "id": f"{self.TEST_PREFIX}stripe",
-            "amount": 470000,
-            "application_fee_amount": 13630,
-            "currency": "pkr",
-            "status": "succeeded",
-            "metadata": {"order_id": self.ORDER_B1_SHOPIFY},
-            "payment_method_details": {"type": "card"},
-            "provider_account_identifier": "acct_explicit",
-        }])[0]
-        self.assertIsNone(stripe.amount)
-        self.assertIsNone(stripe.gateway_fee)
-        self.assertEqual(stripe.currency, "PKR")
-        self.assertEqual(stripe.provider_account_identifier, "acct_explicit")
-        self.assertIsNone(stripe.payment_status)
-        self.assertIsNone(stripe.net_amount)
-
         providers = (
             (JazzCashPaymentProvider(), "Txn Ref No,Merchant Order ID,Txn Type,Txn Amount,Txn Status,Commission\n"
              f"{self.TEST_PREFIX}jc,{self.ORDER_B1_DARAZ},payment,3150,paid,47.25\n"),
-            (EasyPaisaPaymentProvider(), "Transaction ID,Order ID,Type,Gross Amount,Status,Commission\n"
-             f"{self.TEST_PREFIX}ep,{self.ORDER_B1_DARAZ},payment,3150,paid,47.25\n"),
             (ManualPaymentProvider(), '[{"external_payment_id":"' + self.TEST_PREFIX +
              'manual","external_order_id":"' + self.ORDER_B1_SHOPIFY +
              '","amount":"10.00","gateway_fee":"0.00","payment_method":"bank_transfer",'
@@ -246,18 +223,12 @@ class TestPhase6PaymentSettlement(unittest.TestCase):
         self.assertEqual(normalize_status("some-new-provider-state"), None)
         self.assertIsNone(normalize_status("success"))
         self.assertIsNone(normalize_status("completed"))
-        self.assertIsNone(normalize_method("EasyPaisa"))
-
         transformer = PaymentTransformer(self.B1)
         frame = transformer.transform_payment_records(parsed, self._order_map(self.B1))
         self.assertTrue(frame.empty)
         self.assertEqual(len(transformer.rejected_records), 1)
-        for provider_name in ("stripe", "payfast"):
-            with self.subTest(provider=provider_name):
-                with self.assertRaisesRegex(ValueError, "Unsupported payment provider"):
-                    get_payment_provider(provider_name)
-        with self.assertRaisesRegex(RuntimeError, "outside the Pakistan payment scope"):
-            run_stripe_sync(secret_key="must-not-be-used")
+        with self.assertRaisesRegex(ValueError, "Unsupported payment provider"):
+            get_payment_provider("unsupported")
         self.assertIsNone(CODReconciliationProvider().parse_transactions([{
             "tracking_number": "TRACK-ONLY",
             "cod_amount": "100.00",

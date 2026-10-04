@@ -14,18 +14,22 @@ Backward-compatible routes:
 - GET  /auth/shopify/callback
 - POST /api/sync/shopify
 """
+import json
+import logging
 import re
 from typing import Any, Dict, Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from api.dependencies import get_current_business_id
 from auth.connection_service import (
     create_or_update_connection,
     list_connections,
+    setup_jazzcash_sandbox_connection,
     update_status,
 )
 from auth.meta_oauth import (
@@ -47,6 +51,17 @@ from config.settings import BRIDGE_FLOW_FRONTEND_ORIGIN, META_OAUTH_SCOPES
 from pipeline.run_shopify_sync import run_shopify_sync
 from pipeline.run_meta_ads_sync import run_meta_ads_sync
 
+logger = logging.getLogger(__name__)
+
+
+class JazzCashSandboxSetupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    merchant_id: str
+    password: str
+    integrity_salt: str
+
+
 app = FastAPI(
     title="BRIDGE FLOW Backend API",
     description="Multi-Tenant E-Commerce Intelligence Platform Backend",
@@ -63,6 +78,105 @@ app.add_middleware(
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "bridge-flow-api"}
+
+
+async def _receive_jazzcash_notification(request: Request, notification_type: str):
+    content_type = request.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    fields_present = set()
+
+    if media_type == "application/json":
+        try:
+            payload = json.loads(await request.body())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Malformed JazzCash return payload.",
+            ) from None
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="JazzCash return payload must be an object.",
+            )
+        fields_present = set(payload)
+    elif media_type == "application/x-www-form-urlencoded":
+        try:
+            body = (await request.body()).decode("utf-8")
+            fields_present = {
+                key
+                for key, _ in parse_qsl(
+                    body,
+                    keep_blank_values=True,
+                    max_num_fields=1000,
+                )
+            }
+        except (UnicodeDecodeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Malformed JazzCash return payload.",
+            ) from None
+
+    logger.info(
+        "JazzCash %s received method=%s content_type=%s "
+        "has_txn_ref=%s has_response_code=%s has_secure_hash=%s",
+        notification_type,
+        request.method,
+        media_type or "unknown",
+        "pp_TxnRefNo" in fields_present,
+        "pp_ResponseCode" in fields_present,
+        "pp_SecureHash" in fields_present,
+    )
+    return {"status": "received"}
+
+
+@app.post("/integrations/jazzcash/return")
+async def jazzcash_return(request: Request):
+    """Acknowledge JazzCash return data without trusting or persisting it."""
+    return await _receive_jazzcash_notification(request, "return")
+
+
+@app.post("/integrations/jazzcash/ipn")
+async def jazzcash_ipn(request: Request):
+    """Acknowledge JazzCash IPN data without processing or persisting it."""
+    return await _receive_jazzcash_notification(request, "IPN")
+
+
+@app.post("/integrations/jazzcash/connect")
+async def jazzcash_sandbox_connect(
+    request: Request,
+    business_id: int = Depends(get_current_business_id),
+):
+    """Configure JazzCash Sandbox credentials for the authenticated business."""
+    try:
+        payload = await request.json()
+        setup = JazzCashSandboxSetupRequest.model_validate(payload)
+    except (ValueError, ValidationError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid JazzCash Sandbox setup request.",
+        ) from None
+
+    if any(
+        not value.strip()
+        for value in (setup.merchant_id, setup.password, setup.integrity_salt)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid JazzCash Sandbox setup request.",
+        )
+
+    connection_id = setup_jazzcash_sandbox_connection(
+        business_id=business_id,
+        merchant_id=setup.merchant_id,
+        password=setup.password,
+        integrity_salt=setup.integrity_salt,
+    )
+    return {
+        "connection_id": connection_id,
+        "platform": "jazzcash",
+        "account_name": "JazzCash Sandbox",
+        "status": "active",
+    }
 
 
 # ---------------------------------------------------------------------------

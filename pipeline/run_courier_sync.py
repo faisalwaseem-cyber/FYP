@@ -1,11 +1,11 @@
 """
-Multi-Tenant Courier Ingestion Pipeline (BRIDGE FLOW — Phase 5.4).
+Generic courier ingestion pipeline; M&P runtime integration is pending.
 
 Architecture:
     Authenticated Business (business_id)
     → core.platform_connection
     → CredentialManager           (decrypts credentials safely, NO credential exposure)
-    → Courier Client              (PostExClient, TraxClient, LeopardsClient)
+    → Courier Client              (provider-specific implementation)
     → raw.raw_data                (verbatim JSON persistence via save_raw_payload)
     → CourierTransformer / ETL    (canonical shipment & RTO transformation)
     → CourierLoader               (idempotent upsert to core.shipment, core.orders, core.rto_return)
@@ -14,7 +14,7 @@ Architecture:
 
 Design invariants:
     - business_id is strictly propagated through every layer (tenant isolation).
-    - Credentials resolved via CredentialManager (never from env inside multi-tenant flow).
+    - Credentials are resolved via CredentialManager, never from environment fallbacks.
     - Client never writes to database.
     - Idempotent upserts prevent duplicate records.
     - Automatic cascading of shipment statuses to core.orders:
@@ -23,20 +23,15 @@ Design invariants:
         * RTO recorded in core.rto_return
     - Failure behavior: error logged to raw.sync_log and connection marked 'error'.
 """
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from dotenv import load_dotenv
-load_dotenv()
-
 from sqlalchemy import text
 
 from auth.connection_service import (
-    get_connection,
     list_connections,
     update_last_synced,
     update_status,
@@ -45,14 +40,11 @@ from auth.credential_manager import CredentialManager
 from config.database import get_db_connection
 from config.settings import BUSINESS_ID
 from connectors.courier import (
+    ACTIVE_COURIER_PLATFORMS,
+    M_AND_P_IMPLEMENTATION_STATUS,
     BaseCourierClient,
-    CourierAPIError,
     CourierAuthError,
-    CourierRateLimitError,
     CourierTrackingNotFoundError,
-    LeopardsClient,
-    PostExClient,
-    TraxClient,
 )
 from etl.courier_transformer import CourierTransformer
 from loaders.courier_loader import CourierLoader
@@ -71,46 +63,14 @@ def resolve_courier_client(
     credential_manager: Optional[CredentialManager] = None,
 ) -> BaseCourierClient:
     """
-    Resolves and constructs a courier client using decrypted credentials
-    from core.platform_connection via CredentialManager.
-
-    Supported platforms:
-      - 'postex' / 'courier': token-based auth
-      - 'trax': basic auth (username + password)
-      - 'leopards': api_key + api_password
+    M&P is in scope, but its API contract and client are not implemented.
     """
-    cm = credential_manager or CredentialManager()
-    creds = cm.get_valid_credentials(
-        business_id=business_id,
-        platform=platform,
-        account_identifier=account_identifier,
-    )
-
     p = platform.strip().lower()
-    if p in ("postex", "courier"):
-        token = creds.get("access_token") or creds.get("additional_credentials", {}).get("api_token")
-        if not token:
-            raise ValueError(f"PostEx connection for business {business_id} missing access_token.")
-        return PostExClient(api_token=token)
-
-    elif p == "trax":
-        add_creds = creds.get("additional_credentials") or {}
-        username = add_creds.get("username") or creds.get("access_token")
-        password = add_creds.get("password") or creds.get("refresh_token")
-        if not username or not password:
-            raise ValueError(f"Trax connection for business {business_id} missing username/password.")
-        return TraxClient(username=username, password=password)
-
-    elif p == "leopards":
-        add_creds = creds.get("additional_credentials") or {}
-        api_key = add_creds.get("api_key") or creds.get("access_token")
-        api_password = add_creds.get("api_password") or creds.get("refresh_token")
-        if not api_key or not api_password:
-            raise ValueError(f"Leopards connection for business {business_id} missing api_key/api_password.")
-        return LeopardsClient(api_key=api_key, api_password=api_password)
-
-    else:
+    if p not in ACTIVE_COURIER_PLATFORMS:
         raise ValueError(f"Unsupported courier platform: '{platform}'")
+    raise NotImplementedError(
+        f"{p.upper()} courier sync is incomplete: its API contract has not been verified."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -256,119 +216,41 @@ def run_courier_sync(
     """
     conns = list_connections(business_id)
 
-    # Filter to courier category / platforms
+    requested_platform = platform.strip().lower() if platform else None
+    if requested_platform and requested_platform not in ACTIVE_COURIER_PLATFORMS:
+        raise ValueError(f"Unsupported courier platform: '{platform}'")
+
     courier_conns = [
         c for c in conns
-        if c.get("platform_category") == "courier"
-        or c.get("platform", "").lower() in ("postex", "trax", "leopards", "courier")
+        if c.get("platform", "").strip().lower() in ACTIVE_COURIER_PLATFORMS
+        and c.get("status") != "disconnected"
     ]
-
-    if platform:
-        courier_conns = [c for c in courier_conns if c.get("platform", "").lower() == platform.lower()]
 
     if account_identifier:
         courier_conns = [c for c in courier_conns if c.get("account_identifier") == account_identifier]
 
-    # Backward compatibility fallback: if no DB connection registered, check env
-    if not courier_conns and not client:
-        api_token = os.getenv("POSTEX_API_TOKEN", "").strip()
-        if api_token and "xxxxxxxx" not in api_token:
-            print("[*] Running PostEx sync using legacy POSTEX_API_TOKEN env var...")
-            fake_conn = {
-                "connection_id": 0,
-                "platform": "postex",
-                "account_identifier": "env_fallback",
-            }
-            # Directly instantiate client
-            legacy_client = PostExClient(api_token=api_token)
-            # Use a mock logger connection update guard
-            return _run_legacy_sync(
-                business_id=business_id,
-                client=legacy_client,
-                transformer=transformer,
-                loader=loader,
-                default_rto_penalty=default_rto_penalty,
-            )
-
-        print("=" * 70)
-        print("[!] NOTICE: No active courier connections found in core.platform_connection.")
-        print(f"To register a courier connection for business_id={business_id}, use:")
-        print("  auth.connection_service.create_or_update_connection(...)")
-        print("=" * 70)
-        return {"status": "skipped", "reason": "no_courier_connections", "business_id": business_id}
+    if not courier_conns:
+        return {
+            "status": "skipped",
+            "reason": "no_m_and_p_connection",
+            "business_id": business_id,
+        }
 
     results = []
     for conn_info in courier_conns:
-        if conn_info.get("status") == "disconnected":
-            continue
-
-        res = sync_courier_connection(
-            business_id=business_id,
-            conn_info=conn_info,
-            client=client,
-            credential_manager=credential_manager,
-            transformer=transformer,
-            loader=loader,
-            default_rto_penalty=default_rto_penalty,
-        )
-        results.append(res)
+        results.append({
+            "status": M_AND_P_IMPLEMENTATION_STATUS,
+            "reason": "m_and_p_client_not_implemented",
+            "connection_id": conn_info["connection_id"],
+            "platform": conn_info["platform"],
+        })
 
     return {
-        "status": "success",
+        "status": M_AND_P_IMPLEMENTATION_STATUS,
         "business_id": business_id,
-        "connections_synced": len(results),
+        "connections_synced": 0,
         "results": results,
     }
-
-
-def _run_legacy_sync(
-    business_id: int,
-    client: BaseCourierClient,
-    transformer: Optional[CourierTransformer] = None,
-    loader: Optional[CourierLoader] = None,
-    default_rto_penalty: float = 150.0,
-) -> Dict[str, Any]:
-    """Executes sync when running under legacy env token without DB connection."""
-    logger = SyncLogger(business_id=business_id, source="courier_postex")
-    sync_id = logger.start_sync(sync_type="courier_postex_legacy_sync")
-
-    try:
-        active_transformer = transformer or CourierTransformer(business_id=business_id)
-        active_loader = loader or CourierLoader(business_id=business_id)
-
-        with get_db_connection() as conn:
-            active_shipments = conn.execute(
-                text("""
-                    SELECT s.tracking_number, o.external_order_id, c.courier_name
-                    FROM core.shipment s
-                    JOIN core.orders o ON s.order_id = o.order_id
-                    LEFT JOIN core.courier c ON s.courier_id = c.courier_id
-                    WHERE s.business_id = :b_id
-                      AND s.shipment_status IN ('booked', 'in_transit', 'failed_delivery');
-                """),
-                {"b_id": business_id},
-            ).fetchall()
-
-        updated_count = 0
-        for tracking_num, ext_order_id, _ in active_shipments:
-            try:
-                raw_response = client.track_shipment(tracking_num)
-                save_raw_payload(business_id, "courier", "postex_tracking", raw_response)
-                payload = raw_response.get("dist") if isinstance(raw_response.get("dist"), dict) else raw_response
-                if isinstance(payload, dict):
-                    payload["external_order_id"] = ext_order_id
-                    payload["tracking_number"] = tracking_num
-                shipment_data = active_transformer.transform_shipment("postex", payload if isinstance(payload, dict) else raw_response)
-                active_loader.load_shipment(shipment_data, default_rto_penalty=default_rto_penalty)
-                updated_count += 1
-            except Exception as e:
-                print(f"[!] Error tracking shipment {tracking_num}: {e}")
-
-        logger.finish_success(fetched=len(active_shipments), inserted=0, updated=updated_count)
-        return {"status": "success", "business_id": business_id, "fetched": len(active_shipments), "updated": updated_count}
-    except Exception as e:
-        logger.finish_failure(str(e))
-        raise
 
 
 if __name__ == "__main__":

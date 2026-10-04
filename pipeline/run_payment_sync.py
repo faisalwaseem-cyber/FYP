@@ -159,11 +159,3 @@ def run_payment_csv_sync(
         sync_type=sync_type,
         business_id=business_id,
     )
-
-
-def run_stripe_sync(
-    secret_key: Optional[str] = None,
-    created_after: Optional[int] = None,
-    business_id: int = BUSINESS_ID,
-) -> Dict[str, Any]:
-    raise RuntimeError("Stripe synchronization is outside the Pakistan payment scope.")

@@ -10,13 +10,11 @@ from typing import Dict, Type
 
 from connectors.payment.base import BasePaymentProvider
 from connectors.payment.cod_reconciler import CODReconciliationProvider
-from connectors.payment.easypaisa_provider import EasyPaisaPaymentProvider
 from connectors.payment.jazzcash_provider import JazzCashPaymentProvider
 from connectors.payment.manual_provider import ManualPaymentProvider
 
 _REGISTRY: Dict[str, Type[BasePaymentProvider]] = {
     "jazzcash": JazzCashPaymentProvider,
-    "easypaisa": EasyPaisaPaymentProvider,
     "cod": CODReconciliationProvider,
     "manual": ManualPaymentProvider,
     "bank_transfer": ManualPaymentProvider,
@@ -30,7 +28,7 @@ def get_payment_provider(provider_name: str, **kwargs) -> BasePaymentProvider:
     Parameters
     ----------
     provider_name : str
-        'jazzcash' | 'easypaisa' | 'cod' | 'manual' | 'bank_transfer'
+        'jazzcash' | 'cod' | 'manual' | 'bank_transfer'
     """
     key = provider_name.strip().lower()
     cls = _REGISTRY.get(key)
