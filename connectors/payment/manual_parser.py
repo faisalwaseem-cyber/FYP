@@ -24,6 +24,11 @@ class ManualPaymentParser:
 
     REQUIRED_FIELDS = ["external_order_id", "amount", "payment_method", "payment_status"]
 
+    @staticmethod
+    def _text(row: Dict[str, Any], key: str) -> str:
+        value = row.get(key)
+        return str(value).strip() if value is not None else ""
+
     def parse_json(self, json_content: str, gateway_name: str = "manual") -> List[Dict[str, Any]]:
         """
         Parses a JSON string (list of objects) into standardized records.
@@ -43,12 +48,9 @@ class ManualPaymentParser:
         if not isinstance(records, list):
             raise ValueError("JSON content must be a list of payment objects.")
 
-        for r in records:
-            r.setdefault("gateway_name", gateway_name)
-            r.setdefault("external_payment_id", None)
-            r.setdefault("gateway_fee", 0)
-            r.setdefault("payment_type", "payment")
-        return records
+        if not all(isinstance(record, dict) for record in records):
+            raise ValueError("Every JSON payment record must be an object.")
+        return [dict(record) for record in records]
 
     def parse_csv(self, csv_content: str, gateway_name: str = "manual") -> List[Dict[str, Any]]:
         """
@@ -62,14 +64,17 @@ class ManualPaymentParser:
         records = []
         for row in reader:
             records.append({
-                "gateway_name":        gateway_name,
-                "external_payment_id": row.get("external_payment_id", "").strip() or None,
-                "external_order_id":   row.get("external_order_id", "").strip(),
-                "amount":              row.get("amount", "0").strip(),
-                "gateway_fee":         row.get("gateway_fee", "0").strip(),
-                "payment_method":      row.get("payment_method", "other").strip(),
-                "payment_status":      row.get("payment_status", "paid").strip(),
-                "payment_type":        row.get("payment_type", "payment").strip(),
-                "paid_at":             row.get("paid_at", "").strip(),
+                "provider": self._text(row, "provider") or None,
+                "external_payment_id": self._text(row, "external_payment_id") or None,
+                "external_order_id": self._text(row, "external_order_id") or None,
+                "amount": self._text(row, "amount") or None,
+                "gateway_fee": self._text(row, "gateway_fee") or None,
+                "payment_method": self._text(row, "payment_method") or None,
+                "payment_status": self._text(row, "payment_status") or None,
+                "payment_type": self._text(row, "payment_type") or None,
+                "paid_at": self._text(row, "paid_at") or None,
+                "currency": self._text(row, "currency") or None,
+                "provider_account_identifier": self._text(row, "provider_account_identifier") or None,
+                "original_external_payment_id": self._text(row, "original_external_payment_id") or None,
             })
         return records

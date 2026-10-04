@@ -13,25 +13,110 @@ Architecture:
 """
 import hashlib
 import hmac
+import math
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
 
 
-class DarazAPIError(RuntimeError):
-    """Raised when Daraz Open Platform returns an API error response."""
+DARAZ_API_BASE_URL = "https://api.daraz.pk/rest"
+DARAZ_SIGN_METHOD = "hmac"
+MAX_ORDER_PAGE_SIZE = 100
+MAX_PRODUCT_PAGE_SIZE = 50
+MAX_PRODUCT_OFFSET = 10_000
 
-    def __init__(self, code: str, message: str, request_id: Optional[str] = None):
+
+class DarazClientError(RuntimeError):
+    """Base error with messages that never include request credentials."""
+
+
+class DarazAPIError(DarazClientError):
+    def __init__(self, code: Any):
         self.code = str(code)
-        self.error_message = message
-        self.request_id = request_id
-        super().__init__(f"Daraz API Error [{self.code}]: {self.error_message}")
+        super().__init__(f"Daraz API returned an error (code {self.code}).")
 
 
-class DarazRateLimitError(RuntimeError):
-    """Raised when Daraz API call limit or throttling threshold is reached."""
+class DarazHTTPError(DarazClientError):
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"Daraz API returned HTTP {status_code}.")
+
+
+class DarazTimeoutError(DarazClientError):
     pass
+
+
+class DarazTransportError(DarazClientError):
+    pass
+
+
+class DarazResponseError(DarazClientError):
+    pass
+
+
+class DarazPaginationError(DarazClientError):
+    pass
+
+
+def _normalize_api_path(api_path: str) -> str:
+    if not isinstance(api_path, str) or not api_path:
+        raise ValueError("A Daraz API path is required.")
+    normalized = api_path if api_path.startswith("/") else f"/{api_path}"
+    if normalized.startswith("//") or "?" in normalized or "#" in normalized or "://" in normalized:
+        raise ValueError("Daraz API path must be a relative path without a query string.")
+    return normalized
+
+
+def build_signing_string(
+    api_path: str,
+    params: Mapping[str, Any],
+    body: Optional[str] = None,
+) -> str:
+    """Build the official Daraz canonical string from text request parameters."""
+    normalized_path = _normalize_api_path(api_path)
+    if body is not None and not isinstance(body, str):
+        raise TypeError("Daraz request body must be a string when signing.")
+
+    text_params = []
+    for raw_key, value in params.items():
+        key = str(raw_key)
+        if key == "sign" or isinstance(value, (bytes, bytearray, memoryview)):
+            continue
+        if not key or value is None:
+            continue
+        text_value = str(value)
+        if not text_value:
+            continue
+        try:
+            key_order = key.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Daraz parameter names must contain ASCII characters.") from exc
+        text_params.append((key_order, key, text_value))
+
+    text_params.sort(key=lambda item: item[0])
+    canonical = normalized_path + "".join(key + value for _, key, value in text_params)
+    if body is not None:
+        canonical += body
+    return canonical
+
+
+def generate_signature(
+    api_path: str,
+    params: Mapping[str, Any],
+    app_secret: str,
+    body: Optional[str] = None,
+) -> str:
+    if not isinstance(app_secret, str) or not app_secret.strip():
+        raise ValueError("Daraz App Secret is required for request signing.")
+    canonical = build_signing_string(api_path, params, body)
+    digest = hmac.new(
+        app_secret.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest.upper()
 
 
 class DarazClient:
@@ -49,45 +134,62 @@ class DarazClient:
         access_token: Optional[str] = None,
         base_url: str = "https://api.daraz.pk/rest",
         timeout: float = 30.0,
-        max_retries: int = 3,
+        session: Optional[requests.Session] = None,
     ):
-        if not app_key or not app_secret:
-            raise ValueError("Both app_key and app_secret are required to initialize DarazClient.")
+        if not isinstance(app_key, str) or not app_key.strip():
+            raise ValueError("Daraz App Key is required.")
+        if not isinstance(app_secret, str) or not app_secret.strip():
+            raise ValueError("Daraz App Secret is required.")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Daraz request timeout must be a positive finite number.")
 
-        self.app_key = app_key.strip()
-        self._app_secret = app_secret.strip()
+        self._app_key = app_key.strip()
+        self._app_secret = app_secret
         self._access_token = access_token.strip() if access_token else None
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.session = requests.Session()
+        self.timeout = float(timeout)
+        self.session = session if session is not None else requests.Session()
+
+    @classmethod
+    def from_managed_credentials(
+        cls,
+        credentials: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> "DarazClient":
+        """Build from decrypted CredentialManager output; performs no DB access."""
+        additional = credentials.get("additional_credentials")
+        if not isinstance(additional, Mapping):
+            raise ValueError("Daraz App Key and App Secret are required in managed credentials.")
+        app_key = additional.get("app_key")
+        app_secret = additional.get("app_secret")
+        if not isinstance(app_key, str) or not isinstance(app_secret, str):
+            raise ValueError("Daraz App Key and App Secret are required in managed credentials.")
+        return cls(
+            app_key=app_key,
+            app_secret=app_secret,
+            access_token=credentials.get("access_token"),
+            **kwargs,
+        )
 
     def __repr__(self) -> str:
-        # Credential safety: never expose app_secret or access_token in representations
+        key_preview = f"{self._app_key[:4]}***{self._app_key[-2:]}" if self._app_key else "***"
+        token_preview = f"{self._access_token[:4]}***{self._access_token[-2:]}" if self._access_token else "***"
         return (
-            f"<DarazClient app_key='{self.app_key}' base_url='{self.base_url}' "
-            f"token='{'***' if self._access_token else 'None'}'>"
+            f"<DarazClient base_url='{self.base_url}' app_key='{key_preview}' "
+            f"access_token='{token_preview}' app_secret='***'>"
         )
 
     # ------------------------------------------------------------------
     # Request Signing
     # ------------------------------------------------------------------
 
-    def sign_request(self, api_path: str, params: Dict[str, Any]) -> str:
-        """
-        Daraz Open Platform HMAC-SHA256 signature algorithm.
-        1. Sorts all parameters alphabetically by key.
-        2. Concatenates api_path + {key}{value} pairs.
-        3. Generates HMAC-SHA256 with app_secret and converts to uppercase hex.
-        """
-        sorted_params = sorted(params.items(), key=lambda x: str(x[0]))
-        query_string = api_path + "".join([f"{k}{v}" for k, v in sorted_params])
-        sign = hmac.new(
-            self._app_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest().upper()
-        return sign
+    def sign_request(
+        self,
+        api_path: str,
+        params: Mapping[str, Any],
+        body: Optional[str] = None,
+    ) -> str:
+        return generate_signature(api_path, params, self._app_secret, body)
 
     # ------------------------------------------------------------------
     # Core Request Execution with Retries & Error Handling
@@ -96,105 +198,68 @@ class DarazClient:
     def execute(
         self,
         api_path: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Mapping[str, Any]] = None,
         method: str = "GET",
-    ) -> Dict[str, Any]:
-        """
-        Executes an HTTP request to the Daraz Open Platform with automatic signing,
-        transient retry handling, and rate limit backoff.
+        body: Optional[str] = None,
+        access_token_required: bool = True,
+    ) -> Any:
+        normalized_path = _normalize_api_path(api_path)
+        request_method = method.upper()
+        if request_method not in {"GET", "POST"}:
+            raise ValueError("Daraz client supports GET and POST requests only.")
+        if body is not None and not isinstance(body, str):
+            raise TypeError("Daraz request body must be a string.")
 
-        Parameters
-        ----------
-        api_path : str
-            Daraz API path, e.g. '/orders/get' or '/auth/token/refresh'
-        params : dict, optional
-            Query or form parameters
-        method : str
-            HTTP method ('GET' or 'POST')
+        business_params: Dict[str, Any] = {}
+        for raw_key, value in (params or {}).items():
+            key = str(raw_key)
+            normalized_key = key.lower()
+            if normalized_key == "business_id":
+                raise ValueError("business_id must be resolved server-side and cannot be sent to Daraz.")
+            if normalized_key in {"app_key", "access_token", "timestamp", "sign_method"}:
+                raise ValueError("Daraz authentication parameters are managed by the client.")
+            if key != "sign":
+                business_params[key] = value
 
-        Returns
-        -------
-        dict
-            The parsed 'data' or response dictionary from Daraz.
-        """
-        normalized_path = api_path if api_path.startswith("/") else f"/{api_path}"
-        all_params: Dict[str, Any] = {
-            "app_key": self.app_key,
+        if access_token_required and not self._access_token:
+            raise ValueError("A Daraz seller access token is required for this API request.")
+
+        signed_params: Dict[str, Any] = {
+            "app_key": self._app_key,
             "timestamp": str(int(time.time() * 1000)),
-            "sign_method": "sha256",
+            "sign_method": DARAZ_SIGN_METHOD,
+            **business_params,
         }
-        if self._access_token:
-            all_params["access_token"] = self._access_token
-        if params:
-            all_params.update(params)
+        if access_token_required and self._access_token:
+            signed_params["access_token"] = self._access_token
+        signed_params["sign"] = self.sign_request(normalized_path, signed_params, body)
 
-        all_params["sign"] = self.sign_request(normalized_path, all_params)
-        url = f"{self.base_url}{normalized_path}"
+        try:
+            response = self.session.request(
+                method=request_method,
+                url=f"{self.base_url}{normalized_path}",
+                params=signed_params,
+                data=body,
+                timeout=self.timeout,
+            )
+        except requests.Timeout:
+            raise DarazTimeoutError("Daraz API request timed out.") from None
+        except requests.RequestException:
+            raise DarazTransportError("Daraz API request failed.") from None
 
-        retries = 0
-        while retries <= self.max_retries:
-            try:
-                if method.upper() == "POST":
-                    response = self.session.post(url, data=all_params, timeout=self.timeout)
-                else:
-                    response = self.session.get(url, params=all_params, timeout=self.timeout)
+        if response.status_code >= 400:
+            raise DarazHTTPError(response.status_code)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise DarazResponseError("Daraz API returned an unreadable response.") from None
+        if not isinstance(payload, Mapping):
+            raise DarazResponseError("Daraz API returned an unexpected response format.")
 
-                # 1. Rate limiting / 429
-                if response.status_code == 429:
-                    retries += 1
-                    if retries > self.max_retries:
-                        raise DarazRateLimitError(
-                            f"Daraz rate limit HTTP 429 exceeded after {self.max_retries} retries."
-                        )
-                    time.sleep(float(2 ** retries))
-                    continue
-
-                # 2. Transient server errors
-                if response.status_code >= 500:
-                    retries += 1
-                    if retries > self.max_retries:
-                        raise RuntimeError(
-                            f"Daraz server error HTTP {response.status_code} "
-                            f"persisted after {self.max_retries} retries."
-                        )
-                    time.sleep(float(2 ** retries))
-                    continue
-
-                # 3. Client HTTP errors
-                response.raise_for_status()
-
-                res_json = response.json()
-
-                # 4. Daraz business-level error inspection
-                # Code "0" denotes success in Daraz Open Platform
-                code = str(res_json.get("code", "0"))
-                if code != "0" and "code" in res_json:
-                    msg = res_json.get("message", "Unknown Daraz error")
-                    req_id = res_json.get("request_id")
-
-                    # Check for rate limiting in business response
-                    if any(term in code.lower() or term in msg.lower() for term in ("limit", "throttle", "concurrent")):
-                        retries += 1
-                        if retries > self.max_retries:
-                            raise DarazRateLimitError(
-                                f"Daraz API call limit reached: [{code}] {msg}"
-                            )
-                        time.sleep(float(2 ** retries))
-                        continue
-
-                    raise DarazAPIError(code=code, message=msg, request_id=req_id)
-
-                return res_json.get("data", res_json)
-
-            except requests.exceptions.RequestException as exc:
-                retries += 1
-                if retries > self.max_retries:
-                    raise RuntimeError(
-                        f"Network error querying Daraz ({normalized_path}): {exc}"
-                    ) from exc
-                time.sleep(float(2 ** retries))
-
-        raise RuntimeError(f"Max retries exceeded communicating with Daraz ({normalized_path})")
+        code = payload.get("code")
+        if code is not None and str(code) != "0":
+            raise DarazAPIError(code)
+        return payload.get("data", payload)
 
     # ------------------------------------------------------------------
     # Reusable Offset Pagination Generator
@@ -203,69 +268,67 @@ class DarazClient:
     def paginate(
         self,
         api_path: str,
-        params: Optional[Dict[str, Any]] = None,
-        data_key: str = "orders",
-        page_size: int = 100,
+        params: Optional[Mapping[str, Any]] = None,
+        data_key: Optional[str] = None,
+        page_size: Optional[int] = None,
         max_pages: Optional[int] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        """
-        Yields pages of records from a Daraz offset-based pagination endpoint.
+        normalized_path = _normalize_api_path(api_path)
+        if normalized_path == "/orders/get":
+            maximum = MAX_ORDER_PAGE_SIZE
+            result_key = data_key or "orders"
+        elif normalized_path == "/products/get":
+            maximum = MAX_PRODUCT_PAGE_SIZE
+            result_key = data_key or "products"
+        else:
+            raise ValueError("Daraz pagination is supported for orders and products only.")
 
-        Parameters
-        ----------
-        api_path : str
-            e.g. '/orders/get' or '/products/get'
-        params : dict, optional
-            Filters (e.g. created_after, status)
-        data_key : str
-            The key containing the items list in data (e.g. 'orders' or 'products')
-        page_size : int
-            Number of items per page (default: 100, max allowed by Daraz is 100)
-        max_pages : int, optional
-            Safety ceiling on pages to fetch
+        size = maximum if page_size is None else page_size
+        if not isinstance(size, int) or size < 1 or size > maximum:
+            raise ValueError(f"Daraz page size must be between 1 and {maximum} for this endpoint.")
+        if max_pages is not None and (not isinstance(max_pages, int) or max_pages < 1):
+            raise ValueError("max_pages must be a positive integer when provided.")
 
-        Yields
-        ------
-        dict containing:
-            - page (int): 1-indexed page number
-            - offset (int): current offset
-            - count (int): items count in this page
-            - records (list): list of item dictionaries
-            - raw_response (dict): full response data
-        """
-        page_num = 1
-        current_offset = 0
-        p_copy = dict(params or {})
+        base_params = dict(params or {})
+        if normalized_path == "/products/get":
+            base_params.setdefault("filter", "all")
+        try:
+            current_offset = int(base_params.pop("offset", 0))
+        except (TypeError, ValueError):
+            raise ValueError("Daraz pagination offset must be a non-negative integer.") from None
+        if current_offset < 0:
+            raise ValueError("Daraz pagination offset must be a non-negative integer.")
+        if normalized_path == "/products/get" and current_offset > MAX_PRODUCT_OFFSET:
+            raise ValueError(f"Daraz product offset cannot exceed {MAX_PRODUCT_OFFSET}.")
+        base_params.pop("limit", None)
 
-        while True:
-            if max_pages and page_num > max_pages:
-                break
-
-            current_params = dict(p_copy)
-            current_params["limit"] = page_size
-            current_params["offset"] = current_offset
-
-            data = self.execute(api_path, params=current_params, method="GET")
-
-            # Extract list of records
-            items = data.get(data_key, [])
-            if not isinstance(items, list):
-                items = []
+        page_number = 1
+        while max_pages is None or page_number <= max_pages:
+            current_params = dict(base_params)
+            current_params.update({"limit": size, "offset": current_offset})
+            data = self.execute(normalized_path, params=current_params, method="GET")
+            if not isinstance(data, Mapping):
+                raise DarazResponseError("Daraz API returned an unexpected paginated response.")
+            records = data.get(result_key, [])
+            if not isinstance(records, list):
+                raise DarazResponseError("Daraz API returned an unexpected records format.")
 
             yield {
-                "page": page_num,
+                "page": page_number,
                 "offset": current_offset,
-                "count": len(items),
-                "records": items,
+                "count": len(records),
+                "records": records,
                 "raw_response": data,
             }
-
-            # If fewer than page_size items were returned, we have reached the end
-            if len(items) < page_size:
+            if len(records) < size:
                 break
 
-            current_offset += page_size
-            page_num += 1
+            current_offset += size
+            if normalized_path == "/products/get" and current_offset > MAX_PRODUCT_OFFSET:
+                raise DarazPaginationError(
+                    "Daraz product offset limit reached; use a narrower date filter."
+                )
+            page_number += 1
 
     # ------------------------------------------------------------------
     # Required Domain Endpoint Helpers
@@ -278,7 +341,7 @@ class DarazClient:
         update_after: Optional[str] = None,
         update_before: Optional[str] = None,
         status: Optional[str] = None,
-        limit: int = 100,
+        limit: int = MAX_ORDER_PAGE_SIZE,
         offset: int = 0,
     ) -> Dict[str, Any]:
         """
@@ -305,33 +368,37 @@ class DarazClient:
         return self.execute("/order/get", params={"order_id": order_id}, method="GET")
 
     def fetch_order_items(self, order_id: str) -> List[Dict[str, Any]]:
-        """
-        Fetches order line items by order_id from Daraz (/order/items/get).
-        """
         data = self.execute("/order/items/get", params={"order_id": order_id}, method="GET")
-        return data.get("order_items", [])
+        if isinstance(data, list):
+            return data
+        if isinstance(data, Mapping):
+            items = data.get("order_items", [])
+            return items if isinstance(items, list) else []
+        return []
 
     def fetch_products(
         self,
-        filter_status: Optional[str] = None,
+        filter_status: str = "all",
         create_after: Optional[str] = None,
+        create_before: Optional[str] = None,
         update_after: Optional[str] = None,
-        search: Optional[str] = None,
-        limit: int = 100,
+        update_before: Optional[str] = None,
+        limit: int = MAX_PRODUCT_PAGE_SIZE,
         offset: int = 0,
     ) -> Dict[str, Any]:
         """
         Fetches product catalog from Daraz Open Platform (/products/get).
         """
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        if filter_status:
-            params["filter"] = filter_status
+        params["filter"] = filter_status
         if create_after:
             params["create_after"] = create_after
+        if create_before:
+            params["create_before"] = create_before
         if update_after:
             params["update_after"] = update_after
-        if search:
-            params["search"] = search
+        if update_before:
+            params["update_before"] = update_before
 
         return self.execute("/products/get", params=params, method="GET")
 
@@ -344,11 +411,21 @@ class DarazClient:
         Exchanges temporary authorization code for access_token and refresh_token
         via POST /auth/token/create.
         """
-        return self.execute("/auth/token/create", params={"code": code}, method="POST")
+        return self.execute(
+            "/auth/token/create",
+            params={"code": code},
+            method="POST",
+            access_token_required=False,
+        )
 
     def refresh_access_token(self, refresh_token: str) -> Dict[str, Any]:
         """
         Exchanges refresh_token for a new access_token and rotated refresh_token
         via POST /auth/token/refresh.
         """
-        return self.execute("/auth/token/refresh", params={"refresh_token": refresh_token}, method="POST")
+        return self.execute(
+            "/auth/token/refresh",
+            params={"refresh_token": refresh_token},
+            method="POST",
+            access_token_required=False,
+        )

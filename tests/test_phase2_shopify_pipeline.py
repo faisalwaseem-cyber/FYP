@@ -48,6 +48,7 @@ from sqlalchemy import text
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.main import app
+from api.dependencies import get_current_business_id
 from auth.connection_service import (
     create_or_update_connection,
     get_connection,
@@ -62,7 +63,7 @@ from auth.shopify_oauth import (
     verify_shopify_hmac,
 )
 from config.database import get_db_connection
-from config.settings import SHOPIFY_CLIENT_SECRET
+from config.settings import BRIDGE_FLOW_FRONTEND_ORIGIN, SHOPIFY_CLIENT_SECRET
 from pipeline.run_shopify_sync import run_shopify_sync
 from security.encryption import decrypt_token
 
@@ -118,6 +119,42 @@ class TestShopifyPipelineSubPhase3(unittest.TestCase):
         )
         self.assertEqual(bad_response.status_code, 400)
 
+    @patch("api.main.generate_signed_oauth_state", return_value="bound-state")
+    @patch("api.main.build_authorization_url", return_value="https://store-beta.myshopify.com/admin/oauth/authorize?state=bound-state")
+    def test_oauth_connect_start_returns_url_for_resolved_business(self, mock_build_url, mock_state):
+        app.dependency_overrides[get_current_business_id] = lambda: self.test_b2
+        try:
+            response = self.client.post(
+                "/integrations/shopify/connect?shop=store-beta.myshopify.com"
+            )
+        finally:
+            app.dependency_overrides.pop(get_current_business_id, None)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "authorization_url": "https://store-beta.myshopify.com/admin/oauth/authorize?state=bound-state"
+        })
+        mock_state.assert_called_once_with(self.test_b2)
+        mock_build_url.assert_called_once_with(self.shop2, "bound-state")
+
+    def test_frontend_cors_allows_configured_origin(self):
+        response = self.client.options(
+            "/integrations/shopify/connect?shop=store-alpha.myshopify.com",
+            headers={
+                "Origin": BRIDGE_FLOW_FRONTEND_ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), BRIDGE_FLOW_FRONTEND_ORIGIN)
+        allowed_methods = response.headers.get("access-control-allow-methods", "")
+        self.assertTrue(all(method in allowed_methods for method in ("GET", "POST", "OPTIONS")))
+        allowed_headers = response.headers.get("access-control-allow-headers", "").lower()
+        self.assertIn("authorization", allowed_headers)
+        self.assertIn("content-type", allowed_headers)
+
     def test_oauth_state_single_use_and_expiration(self):
         nonce = generate_signed_oauth_state(business_id=self.test_b1)
         self.assertTrue(nonce)
@@ -158,15 +195,15 @@ class TestShopifyPipelineSubPhase3(unittest.TestCase):
         valid_hmac = hmac.new("mock_secret_key_12345".encode(), msg.encode(), hashlib.sha256).hexdigest()
         params["hmac"] = valid_hmac
 
-        response = self.client.get("/integrations/shopify/callback", params=params)
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["status"], "success")
-        self.assertEqual(data["business_id"], self.test_b1)
-        self.assertEqual(data["store_domain"], self.shop1)
-        # Ensure tokens are NEVER exposed in response
-        self.assertNotIn("access_token", data)
-        self.assertNotIn("refresh_token", data)
+        response = self.client.get(
+            "/integrations/shopify/callback",
+            params=params,
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers.get("location"), f"{BRIDGE_FLOW_FRONTEND_ORIGIN}/?shopify=connected")
+        self.assertNotIn("shpat_new_access_token_111", response.headers["location"])
+        self.assertNotIn("shprt_new_refresh_token_222", response.headers["location"])
 
         # Verify storage in core.platform_connection
         conn = get_connection(self.test_b1, "shopify", self.shop1)
@@ -176,6 +213,28 @@ class TestShopifyPipelineSubPhase3(unittest.TestCase):
         self.assertNotEqual(conn["encrypted_access_token"], "shpat_new_access_token_111")
         self.assertEqual(decrypt_token(conn["encrypted_access_token"]), "shpat_new_access_token_111")
         self.assertEqual(decrypt_token(conn["encrypted_refresh_token"]), "shprt_new_refresh_token_222")
+
+    @patch("api.main.verify_shopify_hmac", return_value=False)
+    def test_callback_failure_redirects_without_exposing_credentials(self, _mock_hmac):
+        response = self.client.get(
+            "/integrations/shopify/callback",
+            params={
+                "shop": self.shop1,
+                "code": "synthetic-authorization-code",
+                "state": "synthetic-state",
+                "hmac": "invalid",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            response.headers.get("location"),
+            f"{BRIDGE_FLOW_FRONTEND_ORIGIN}/?shopify=error&reason=invalid_hmac",
+        )
+        self.assertNotIn("synthetic-authorization-code", response.headers["location"])
+        self.assertNotIn("access_token", response.headers["location"])
+        self.assertNotIn("refresh_token", response.headers["location"])
 
     def test_hmac_verification_security(self):
         secret = "secret_for_hmac_test_456"

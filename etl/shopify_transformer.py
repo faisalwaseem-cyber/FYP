@@ -1,5 +1,4 @@
-import re
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,8 +6,13 @@ import pandas as pd
 
 from etl.normalizers import (
     normalize_order_status,
+    normalize_currency_code,
+    normalize_location,
+    normalize_money,
     normalize_pakistan_phone,
     normalize_payment_method,
+    normalize_timestamp,
+    synthetic_pakistan_phone,
 )
 from etl.validator import DataValidator
 
@@ -27,25 +31,21 @@ def extract_numeric_id(gid_or_id: Any) -> str:
     return val
 
 
-def extract_money_amount(money_set: Any) -> float:
+def extract_money_amount(money_set: Any) -> Decimal:
     """
     Extracts monetary decimal amount from a Shopify GraphQL MoneyV2 or PriceSet dict.
     e.g. {'shopMoney': {'amount': '4250.00', 'currencyCode': 'PKR'}} -> 4250.0
-    Preserves exact 2-decimal precision matching NUMERIC(12,2).
+    Returns a Decimal matching NUMERIC(12,2).
     """
     if not money_set or not isinstance(money_set, dict):
-        return 0.0
+        return Decimal("0.00")
 
     inner = money_set.get("shopMoney") or money_set
     if isinstance(inner, dict):
         amt_str = inner.get("amount")
         if amt_str is not None:
-            try:
-                dec = Decimal(str(amt_str))
-                return max(0.0, float(round(dec, 2)))
-            except Exception:
-                pass
-    return 0.0
+            return normalize_money(amt_str)
+    return Decimal("0.00")
 
 
 def normalize_graphql_order_status(order: Dict[str, Any]) -> str:
@@ -89,7 +89,7 @@ class ShopifyTransformer:
 
         for o in raw_orders:
             ext_order_id = str(o["id"])
-            order_date = o.get("created_at")
+            order_date = normalize_timestamp(o.get("created_at"))
             shipping_addr = o.get("shipping_address") or {}
             cust = o.get("customer") or {}
 
@@ -100,8 +100,7 @@ class ShopifyTransformer:
             # If phone is absent, generate a unique deterministic synthetic number
             # to satisfy core.customer NOT NULL and regex constraint: ^\+92[0-9]{10}$
             if not phone:
-                synthetic_digits = f"{abs(hash(ext_order_id)) % 1000000000:09d}"
-                phone = f"+923{synthetic_digits}"
+                phone = synthetic_pakistan_phone("shopify", ext_order_id)
 
             ext_customer_id = str(cust.get("id")) if cust.get("id") else f"guest_{ext_order_id}"
             full_name = f"{cust.get('first_name') or ''} {cust.get('last_name') or ''}".strip()
@@ -121,17 +120,17 @@ class ShopifyTransformer:
             order_status = normalize_order_status(o)
             payment_method = normalize_payment_method(o)
 
-            subtotal = max(0.0, float(o.get("subtotal_price") or 0.0))
-            discounts = max(0.0, float(o.get("total_discounts") or 0.0))
+            subtotal = normalize_money(o.get("subtotal_price"))
+            discounts = normalize_money(o.get("total_discounts"))
 
             shipping_charged = 0.0
             shipping_lines = o.get("shipping_lines") or []
             if shipping_lines:
-                shipping_charged = sum(float(line.get("price") or 0.0) for line in shipping_lines)
+                shipping_charged = sum((normalize_money(line.get("price")) for line in shipping_lines), Decimal("0.00"))
             elif o.get("total_shipping_price_set"):
-                shipping_charged = float(o["total_shipping_price_set"].get("shop_money", {}).get("amount") or 0.0)
+                shipping_charged = normalize_money(o["total_shipping_price_set"].get("shop_money", {}).get("amount"))
 
-            total_amount = max(0.0, float(o.get("total_price") or 0.0))
+            total_amount = normalize_money(o.get("total_price"))
 
             orders_list.append({
                 "business_id": self.business_id,
@@ -142,11 +141,11 @@ class ShopifyTransformer:
                 "payment_method": payment_method,
                 "subtotal_amount": subtotal,
                 "discount_amount": discounts,
-                "shipping_charged": max(0.0, shipping_charged),
+                "shipping_charged": shipping_charged,
                 "total_amount": total_amount,
-                "currency": o.get("currency", "PKR"),
-                "shipping_city": shipping_addr.get("city"),
-                "shipping_province": shipping_addr.get("province"),
+                "currency": normalize_currency_code(o.get("currency")),
+                "shipping_city": normalize_location(shipping_addr.get("city")),
+                "shipping_province": normalize_location(shipping_addr.get("province")),
                 "source_platform": "shopify"
             })
 
@@ -155,7 +154,7 @@ class ShopifyTransformer:
                 prod_id = item.get("product_id")
                 var_id = item.get("variant_id")
                 ext_prod_id = str(prod_id) if prod_id else f"var_{var_id}"
-                unit_price = max(0.0, float(item.get("price") or 0.0))
+                unit_price = normalize_money(item.get("price"))
 
                 products_list.append({
                     "business_id": self.business_id,
@@ -173,7 +172,7 @@ class ShopifyTransformer:
                     "external_product_id": ext_prod_id,
                     "quantity": max(1, int(item.get("quantity") or 1)),
                     "unit_price": unit_price,
-                    "discount_amount": max(0.0, float(item.get("total_discount") or 0.0)),
+                    "discount_amount": normalize_money(item.get("total_discount")),
                     "unit_cost_at_sale": 0.0
                 })
 
@@ -208,7 +207,7 @@ class ShopifyTransformer:
 
         for o in raw_orders:
             ext_order_id = extract_numeric_id(o.get("id"))
-            order_date = o.get("createdAt")
+            order_date = normalize_timestamp(o.get("createdAt"))
             shipping_addr = o.get("shippingAddress") or {}
             cust = o.get("customer") or {}
 
@@ -218,8 +217,7 @@ class ShopifyTransformer:
 
             # If phone is absent, generate deterministic synthetic phone for guest checkout
             if not phone:
-                synthetic_digits = f"{abs(hash(ext_order_id)) % 1000000000:09d}"
-                phone = f"+923{synthetic_digits}"
+                phone = synthetic_pakistan_phone("shopify", ext_order_id)
 
             cust_gid = cust.get("id")
             ext_customer_id = (
@@ -230,13 +228,16 @@ class ShopifyTransformer:
             if not full_name:
                 full_name = shipping_addr.get("name") or "Guest Customer"
 
+            if not full_name or full_name == "":
+                full_name = "Guest Customer"
+
             customers_list.append({
                 "business_id": self.business_id,
                 "external_customer_id": ext_customer_id,
                 "full_name": full_name,
                 "phone": phone,
                 "email": cust.get("email"),
-                "city": shipping_addr.get("city"),
+                "city": normalize_location(shipping_addr.get("city")),
             })
 
             # 2. Order Normalization
@@ -253,7 +254,7 @@ class ShopifyTransformer:
             shipping_charged = extract_money_amount(o.get("totalShippingPriceSet"))
             total_amount = extract_money_amount(o.get("currentTotalPriceSet"))
 
-            currency = o.get("currencyCode") or "PKR"
+            currency = normalize_currency_code(o.get("currencyCode"))
 
             orders_list.append({
                 "business_id": self.business_id,
@@ -267,8 +268,8 @@ class ShopifyTransformer:
                 "shipping_charged": shipping_charged,
                 "total_amount": total_amount,
                 "currency": currency,
-                "shipping_city": shipping_addr.get("city"),
-                "shipping_province": shipping_addr.get("province"),
+                "shipping_city": normalize_location(shipping_addr.get("city")),
+                "shipping_province": normalize_location(shipping_addr.get("province")),
                 "source_platform": "shopify",
             })
 
@@ -383,7 +384,7 @@ class ShopifyTransformer:
             if var_nodes:
                 for v in var_nodes:
                     sku = v.get("sku") or f"NO_SKU_{ext_prod_id}"
-                    price = max(0.0, float(v.get("price") or 0.0))
+                    price = normalize_money(v.get("price"))
                     products_list.append({
                         "business_id": self.business_id,
                         "external_product_id": ext_prod_id,
@@ -427,8 +428,7 @@ class ShopifyTransformer:
             phone = normalize_pakistan_phone(raw_phone)
             if not phone:
                 # Need valid E.164 phone to satisfy core.customer NOT NULL
-                synthetic_digits = f"{abs(hash(ext_cust_id)) % 1000000000:09d}"
-                phone = f"+923{synthetic_digits}"
+                phone = synthetic_pakistan_phone("shopify", ext_cust_id)
 
             first = c.get("firstName") or ""
             last = c.get("lastName") or ""

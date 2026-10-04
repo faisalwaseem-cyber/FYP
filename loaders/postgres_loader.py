@@ -61,8 +61,8 @@ class PostgresLoader:
                     "external_product_id": r["external_product_id"],
                     "sku": r["sku"],
                     "product_name": r["product_name"],
-                    "selling_price": float(r["selling_price"]),
-                    "unit_cost": float(r["unit_cost"]),
+                    "selling_price": r["selling_price"],
+                    "unit_cost": r["unit_cost"],
                     "is_active": bool(r["is_active"])
                 })
             conn.commit()
@@ -145,10 +145,10 @@ class PostgresLoader:
                     "order_date": r["order_date"],
                     "order_status": r["order_status"],
                     "payment_method": r["payment_method"],
-                    "subtotal_amount": float(r["subtotal_amount"]),
-                    "discount_amount": float(r["discount_amount"]),
-                    "shipping_charged": float(r["shipping_charged"]),
-                    "total_amount": float(r["total_amount"]),
+                    "subtotal_amount": r["subtotal_amount"],
+                    "discount_amount": r["discount_amount"],
+                    "shipping_charged": r["shipping_charged"],
+                    "total_amount": r["total_amount"],
                     "currency": r["currency"],
                     "shipping_city": r["shipping_city"] if pd.notnull(r["shipping_city"]) else None,
                     "shipping_province": r["shipping_province"] if pd.notnull(r["shipping_province"]) else None,
@@ -173,9 +173,9 @@ class PostgresLoader:
                         "external_order_id": item_row["external_order_id"],
                         "external_product_id": item_row["external_product_id"],
                         "quantity": int(item_row["quantity"]),
-                        "unit_price": float(item_row["unit_price"]),
-                        "discount_amount": float(item_row["discount_amount"]),
-                        "unit_cost_at_sale": float(item_row["unit_cost_at_sale"])
+                        "unit_price": item_row["unit_price"],
+                        "discount_amount": item_row["discount_amount"],
+                        "unit_cost_at_sale": item_row["unit_cost_at_sale"],
                     })
 
             conn.commit()

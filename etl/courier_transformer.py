@@ -60,8 +60,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
+
+from etl.normalizers import normalize_money, normalize_timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +148,12 @@ def normalize_rto_reason(raw_status: Optional[str]) -> str:
     return f"Courier status: {s}"
 
 
-def _parse_money(value: Any) -> float:
+def _parse_money(value: Any) -> Decimal:
     """
-    Safely converts any numeric-like value to a non-negative float
-    rounded to 2 decimal places, matching NUMERIC(12,2).
-    Returns 0.0 on any parse failure.
+    Safely converts any numeric-like value to a non-negative Decimal
+    rounded to 2 places, matching NUMERIC(12,2).
     """
-    if value is None:
-        return 0.0
-    try:
-        dec = Decimal(str(value).strip().replace(",", ""))
-        return max(0.0, float(round(dec, 2)))
-    except (InvalidOperation, ValueError):
-        return 0.0
+    return normalize_money(value)
 
 
 def _parse_int_non_negative(value: Any, default: int = 0) -> int:
@@ -169,18 +164,9 @@ def _parse_int_non_negative(value: Any, default: int = 0) -> int:
         return default
 
 
-def _parse_timestamp(value: Any) -> Optional[str]:
-    """
-    Returns the value as-is if it looks like a timestamp string, or None.
-    Passes through ISO 8601 strings and datetime objects.
-    SQLAlchemy / psycopg2 handles casting from strings via CAST(:x AS TIMESTAMPTZ).
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.isoformat()
-    s = str(value).strip()
-    return s if s else None
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Return an aware UTC datetime for TIMESTAMPTZ fields."""
+    return normalize_timestamp(value)
 
 
 # ---------------------------------------------------------------------------
@@ -473,9 +459,9 @@ class CourierTransformer:
             "external_order_id":    shipment_data["external_order_id"],
             "return_type":          return_type,
             "return_reason":        reason,
-            "return_date":          datetime.now(timezone.utc).isoformat(),
-            "return_shipping_cost": max(0.0, round(float(return_shipping_cost), 2)),
-            "refund_amount":        max(0.0, round(float(refund_amount), 2)),
+            "return_date":          datetime.now(timezone.utc),
+            "return_shipping_cost": normalize_money(return_shipping_cost),
+            "refund_amount":        normalize_money(refund_amount),
         }
 
     # ------------------------------------------------------------------

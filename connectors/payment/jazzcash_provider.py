@@ -1,13 +1,4 @@
-"""
-JazzCash Pakistan Settlement Provider — BRIDGE FLOW Phase 6
-===========================================================
-
-Integration methods supported:
-- CSV / Excel merchant settlement statement export (Mobilink Microfinance Bank)
-
-JazzCash provides daily/weekly settlement statements through their merchant portal.
-Typical fee: 1.5% for JazzCash mobile account transactions.
-"""
+"""Offline parsing of supplied JazzCash transaction rows."""
 from __future__ import annotations
 
 import csv
@@ -17,6 +8,7 @@ from typing import Any, Dict, List, Union
 from connectors.payment.base import (
     BasePaymentProvider,
     PaymentRecord,
+    normalize_method,
     normalize_status,
     normalize_type,
     safe_parse_money,
@@ -24,71 +16,37 @@ from connectors.payment.base import (
 
 
 class JazzCashPaymentProvider(BasePaymentProvider):
-    PROVIDER_NAME: str = "jazzcash"
+    PROVIDER_NAME = "jazzcash"
     SUPPORTED_METHODS = {"csv", "settlement"}
 
-    COLUMN_ALIASES = {
-        "txn_id":   ["Txn Ref No", "transaction_id", "Txn ID", "Transaction Ref", "pp_TxnRefNo"],
-        "order_id": ["Merchant Order ID", "order_id", "Order ID", "pp_BillReference", "Reference"],
-        "amount":   ["Txn Amount", "amount", "Amount", "pp_Amount", "Gross Amount"],
-        "fee":      ["Commission", "fee", "Fee", "Bank Charges", "FED", "Charges"],
-        "status":   ["Txn Status", "status", "Status", "Response Code", "pp_ResponseCode"],
-        "type":     ["Txn Type", "type", "Type"],
-        "date":     ["Txn Date Time", "date", "Date", "Timestamp", "Settlement Date"],
-    }
-
-    def __init__(self, default_fee_rate: float = 0.015):
-        # 1.5% standard JazzCash merchant rate
-        super().__init__(default_fee_rate=default_fee_rate)
-
-    def _resolve(self, row: Dict[str, Any], key: str) -> str:
-        for alias in self.COLUMN_ALIASES.get(key, []):
-            if alias in row and row[alias] is not None:
-                return str(row[alias]).strip()
-        return ""
-
     def parse_transactions(self, raw_data: Union[str, List[Dict[str, Any]]]) -> List[PaymentRecord]:
-        if isinstance(raw_data, str):
-            reader = csv.DictReader(io.StringIO(raw_data.strip()))
-            rows = list(reader)
-        elif isinstance(raw_data, list):
-            rows = raw_data
-        else:
+        rows = list(csv.DictReader(io.StringIO(raw_data.strip()))) if isinstance(raw_data, str) else raw_data
+        if not isinstance(rows, list):
             return []
-
-        records: List[PaymentRecord] = []
-        for r in rows:
-            ext_order_id = self._resolve(r, "order_id")
-            ext_payment_id = self._resolve(r, "txn_id") or None
-
-            amount = safe_parse_money(self._resolve(r, "amount") or r.get("amount", 0))
-
-            raw_fee = self._resolve(r, "fee")
-            if raw_fee:
-                fee = safe_parse_money(raw_fee)
-            else:
-                fee = self.calculate_fee(amount, method="wallet")
-
-            raw_status = self._resolve(r, "status")
-            status = "paid" if raw_status in ("000", "0", "paid", "success", "completed") else normalize_status(raw_status)
-            pay_type = normalize_type(self._resolve(r, "type") or "payment")
-            paid_at = self._resolve(r, "date") or None
-
+        records = []
+        for row in rows:
+            payment_id = row.get("external_payment_id")
+            order_id = row.get("external_order_id")
+            amount = row.get("canonical_amount")
+            fee = row.get("gateway_fee")
+            status = row.get("payment_status")
+            transaction_type = row.get("payment_type")
+            date = row.get("paid_at")
+            currency = row.get("currency")
+            account = row.get("provider_account_identifier")
             records.append(PaymentRecord(
-                external_payment_id=ext_payment_id,
-                external_order_id=ext_order_id,
-                amount=amount,
-                gateway_fee=fee,
-                payment_method="wallet",
-                payment_type=pay_type,
-                payment_status=status,
-                settlement_status="settled" if status == "paid" else "pending",
-                settlement_date=paid_at,
-                paid_at=paid_at,
-                currency="PKR",
-                gateway_name=self.PROVIDER_NAME,
-                raw_metadata=dict(r),
+                external_order_id=str(order_id).strip() if order_id and str(order_id).strip() else None,
+                amount=safe_parse_money(amount),
+                gateway_fee=safe_parse_money(fee),
+                external_payment_id=str(payment_id).strip() if payment_id and str(payment_id).strip() else None,
+                payment_method=normalize_method(row.get("payment_method")),
+                payment_type=normalize_type(transaction_type),
+                payment_status=normalize_status(status),
+                paid_at=str(date).strip() if date else None,
+                currency=str(currency).strip().upper() if currency and len(str(currency).strip()) == 3 else None,
+                provider=self.PROVIDER_NAME,
+                provider_account_identifier=str(account).strip() if account and str(account).strip() else None,
+                original_external_payment_id=row.get("original_payment_id") or None,
+                raw_metadata=dict(row),
             ))
-
         return records
-

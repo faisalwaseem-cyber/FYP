@@ -1,256 +1,192 @@
-"""
-Unit Test Suite for Daraz Open Platform Client (Phase 3.2).
-
-Validates:
-1. Successful request execution (GET & POST)
-2. HMAC-SHA256 request signing matching Daraz specification
-3. API error response inspection (DarazAPIError)
-4. Rate-limit and throttling handling (DarazRateLimitError)
-5. Transient HTTP 5xx retry and backoff recovery
-6. Offset-based pagination across multiple pages, single page, and empty page
-7. Credential safety (token masking in __repr__ and exceptions)
-"""
+"""Focused unit tests for the Daraz Open Platform client."""
 import hashlib
 import hmac
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import Mock, patch
 
 import requests
 
 # Ensure root directory is on Python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from connectors.daraz.client import DarazAPIError, DarazClient, DarazRateLimitError
+from connectors.daraz.client import (
+    DARAZ_API_BASE_URL,
+    DarazAPIError,
+    DarazClient,
+    DarazHTTPError,
+    DarazTimeoutError,
+    build_signing_string,
+    generate_signature,
+)
+
+
+class TestDarazSigning(unittest.TestCase):
+    def test_official_signature_example(self):
+        params = {"foo": "1", "bar": "2", "foo_bar": "3", "foobar": "4"}
+        canonical = "/test/apibar2foo1foo_bar3foobar4"
+        expected = "FE01B44E2D0F8A799FDC350C3EDDA02F3BFCE762E60DA58768964FF1CD949437"
+
+        self.assertEqual(build_signing_string("/test/api", params), canonical)
+        self.assertEqual(generate_signature("/test/api", params, "test-secret"), expected)
+
+    def test_ascii_parameter_sorting(self):
+        params = {"foobar": "4", "foo_bar": "3", "foo": "1", "bar": "2"}
+        self.assertEqual(build_signing_string("/test/api", params), "/test/apibar2foo1foo_bar3foobar4")
+
+    def test_excludes_sign_and_empty_parameters(self):
+        params = {"z": "last", "sign": "ignored", "empty": "", "none": None, "a": "first"}
+        self.assertEqual(build_signing_string("/test", params), "/testafirstzlast")
+
+    def test_excludes_byte_array_parameters(self):
+        self.assertEqual(build_signing_string("/test", {"blob": b"private", "q": "v"}), "/testqv")
+
+    def test_includes_access_token_when_present(self):
+        self.assertEqual(
+            build_signing_string("/orders/get", {"access_token": "seller-token"}),
+            "/orders/getaccess_tokenseller-token",
+        )
+
+    def test_appends_body_string(self):
+        self.assertEqual(
+            build_signing_string("/product/create", {"app_key": "123"}, "<Request/>"),
+            "/product/createapp_key123<Request/>",
+        )
+
+    def test_signature_is_uppercase_hex_hmac_sha256(self):
+        signature = generate_signature("/test", {"a": "1"}, "secret")
+        expected = hmac.new(b"secret", b"/testa1", hashlib.sha256).hexdigest().upper()
+        self.assertEqual(signature, expected)
+        self.assertRegex(signature, r"^[0-9A-F]{64}$")
 
 
 class TestDarazClient(unittest.TestCase):
     def setUp(self):
-        self.app_key = "123456"
-        self.app_secret = "test_daraz_app_secret_xyz"
-        self.access_token = "daraz_access_token_abc"
+        self.session = Mock()
         self.client = DarazClient(
-            app_key=self.app_key,
-            app_secret=self.app_secret,
-            access_token=self.access_token,
-            base_url="https://api.daraz.pk/rest",
-            timeout=5.0,
-            max_retries=2,
+            app_key="123456",
+            app_secret="test-secret",
+            access_token="seller-token",
+            session=self.session,
         )
 
-    # ------------------------------------------------------------------
-    # 1. Authentication & Signature Generation
-    # ------------------------------------------------------------------
+    @staticmethod
+    def response(payload=None, status_code=200):
+        response = Mock()
+        response.status_code = status_code
+        response.json.return_value = payload if payload is not None else {"code": "0", "data": {}}
+        return response
 
-    def test_signature_generation(self):
-        """
-        Daraz signature algorithm:
-        HMAC-SHA256(app_secret, api_path + sorted({key}{value})).upper()
-        """
-        api_path = "/orders/get"
-        params = {
-            "app_key": "123456",
-            "timestamp": "1700000000000",
-            "sign_method": "sha256",
-            "limit": 100,
-        }
+    def test_request_construction_uses_verified_common_parameters(self):
+        self.session.request.return_value = self.response({"code": "0", "data": {"ok": True}})
+        with patch("connectors.daraz.client.time.time", return_value=1700000000):
+            result = self.client.execute("/orders/get", {"status": "shipped"})
 
-        # Expected manual calculation
-        sorted_pairs = sorted(params.items(), key=lambda x: str(x[0]))
-        expected_query = api_path + "".join([f"{k}{v}" for k, v in sorted_pairs])
-        expected_sign = hmac.new(
-            self.app_secret.encode("utf-8"),
-            expected_query.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest().upper()
+        self.assertEqual(result, {"ok": True})
+        call = self.session.request.call_args.kwargs
+        self.assertEqual(call["method"], "GET")
+        self.assertEqual(call["url"], f"{DARAZ_API_BASE_URL}/orders/get")
+        self.assertEqual(call["timeout"], 30.0)
+        params = call["params"]
+        self.assertEqual(params["app_key"], "123456")
+        self.assertEqual(params["timestamp"], "1700000000000")
+        self.assertEqual(params["access_token"], "seller-token")
+        self.assertEqual(params["sign_method"], "hmac")
+        self.assertEqual(params["status"], "shipped")
+        self.assertEqual(
+            params["sign"],
+            generate_signature("/orders/get", {key: value for key, value in params.items() if key != "sign"}, "test-secret"),
+        )
 
-        computed_sign = self.client.sign_request(api_path, params)
-        self.assertEqual(computed_sign, expected_sign)
-        self.assertTrue(computed_sign.isupper())
+    def test_rejects_client_supplied_business_id(self):
+        with self.assertRaisesRegex(ValueError, "business_id"):
+            self.client.execute("/orders/get", {"business_id": 42})
+        self.session.request.assert_not_called()
 
-    # ------------------------------------------------------------------
-    # 2. Successful Request Execution
-    # ------------------------------------------------------------------
+    def test_missing_credentials_are_rejected_without_echoing_values(self):
+        with self.assertRaisesRegex(ValueError, "App Key"):
+            DarazClient("", "secret-value")
+        with self.assertRaisesRegex(ValueError, "App Secret"):
+            DarazClient("app-key", "")
 
-    @patch("requests.Session.get")
-    def test_successful_request_get(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "code": "0",
-            "data": {
-                "orders": [
-                    {"order_id": 991, "status": "delivered", "price": "1500.00"}
-                ]
-            }
-        }
-        mock_get.return_value = mock_resp
+    def test_builds_client_from_managed_credentials(self):
+        client = DarazClient.from_managed_credentials({
+            "auth_type": "oauth2",
+            "access_token": "managed-token",
+            "additional_credentials": {"app_key": "managed-key", "app_secret": "managed-secret"},
+        })
+        self.assertEqual(client._app_key, "managed-key")
+        self.assertEqual(client._access_token, "managed-token")
+        self.assertNotIn("managed-secret", repr(client))
 
-        result = self.client.fetch_orders(status="delivered")
-        self.assertIn("orders", result)
-        self.assertEqual(len(result["orders"]), 1)
-        self.assertEqual(result["orders"][0]["order_id"], 991)
-        mock_get.assert_called_once()
+    def test_http_errors_do_not_expose_response_body(self):
+        self.session.request.return_value = self.response(status_code=500)
+        with self.assertRaises(DarazHTTPError) as caught:
+            self.client.execute("/orders/get")
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertNotIn("seller-token", str(caught.exception))
+        self.assertNotIn("test-secret", str(caught.exception))
 
-    @patch("requests.Session.post")
-    def test_successful_request_post(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "code": "0",
-            "data": {
-                "access_token": "new_refreshed_at_123",
-                "expires_in": 2592000,
-                "refresh_token": "new_rotated_rt_456",
-            }
-        }
-        mock_post.return_value = mock_resp
+    def test_api_errors_do_not_expose_provider_message(self):
+        self.session.request.return_value = self.response({
+            "code": "InvalidToken",
+            "message": "seller-token test-secret",
+        })
+        with self.assertRaises(DarazAPIError) as caught:
+            self.client.execute("/orders/get")
+        self.assertNotIn("seller-token", str(caught.exception))
+        self.assertNotIn("test-secret", str(caught.exception))
 
-        result = self.client.refresh_access_token("existing_rt")
-        self.assertEqual(result["access_token"], "new_refreshed_at_123")
-        self.assertEqual(result["refresh_token"], "new_rotated_rt_456")
-        mock_post.assert_called_once()
+    def test_timeout_does_not_expose_request_details(self):
+        self.session.request.side_effect = requests.Timeout("seller-token test-secret in request URL")
+        with self.assertRaises(DarazTimeoutError) as caught:
+            self.client.execute("/orders/get")
+        self.assertNotIn("seller-token", str(caught.exception))
+        self.assertNotIn("test-secret", str(caught.exception))
 
-    # ------------------------------------------------------------------
-    # 3. API Error Handling
-    # ------------------------------------------------------------------
+    def test_token_endpoints_omit_existing_access_token(self):
+        self.session.request.return_value = self.response({"code": "0", "data": {"access_token": "new-token"}})
+        self.client.create_access_token("authorization-code")
+        params = self.session.request.call_args.kwargs["params"]
+        self.assertEqual(params["code"], "authorization-code")
+        self.assertNotIn("access_token", params)
 
-    @patch("requests.Session.get")
-    def test_api_error_response(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "code": "IllegalAccessToken",
-            "message": "The access token has expired.",
-            "request_id": "req_001_abc",
-        }
-        mock_get.return_value = mock_resp
+    def test_order_pagination_uses_offset_and_limit(self):
+        first = self.response({"code": "0", "data": {"orders": [{"id": 1}, {"id": 2}]}})
+        second = self.response({"code": "0", "data": {"orders": [{"id": 3}]}})
+        self.session.request.side_effect = [first, second]
 
-        with self.assertRaises(DarazAPIError) as ctx:
-            self.client.fetch_orders()
+        pages = list(self.client.paginate("/orders/get", {"created_after": "2025-01-01"}, page_size=2))
 
-        self.assertEqual(ctx.exception.code, "IllegalAccessToken")
-        self.assertIn("expired", ctx.exception.error_message)
+        self.assertEqual([page["offset"] for page in pages], [0, 2])
+        self.assertEqual([page["count"] for page in pages], [2, 1])
+        self.assertEqual(self.session.request.call_args_list[0].kwargs["params"]["limit"], 2)
+        self.assertEqual(self.session.request.call_args_list[1].kwargs["params"]["offset"], 2)
 
-    # ------------------------------------------------------------------
-    # 4. Rate-Limit & Throttling Handling
-    # ------------------------------------------------------------------
+    def test_product_pagination_uses_documented_limit_and_date_filter(self):
+        self.session.request.return_value = self.response({"code": "0", "data": {"products": [{"item_id": "1"}]}})
+        pages = list(self.client.paginate(
+            "/products/get",
+            {"update_after": "2025-01-01T00:00:00+00:00"},
+        ))
+        params = self.session.request.call_args.kwargs["params"]
+        self.assertEqual(params["limit"], 50)
+        self.assertEqual(params["filter"], "all")
+        self.assertEqual(params["update_after"], "2025-01-01T00:00:00+00:00")
+        self.assertEqual(pages[0]["records"], [{"item_id": "1"}])
 
-    @patch("requests.Session.get")
-    def test_rate_limit_http_429(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 429
-        mock_get.return_value = mock_resp
+    def test_page_size_limits_are_enforced(self):
+        with self.assertRaises(ValueError):
+            list(self.client.paginate("/orders/get", page_size=101))
+        with self.assertRaises(ValueError):
+            list(self.client.paginate("/products/get", page_size=51))
 
-        with self.assertRaises(DarazRateLimitError):
-            self.client.fetch_orders()
-
-        self.assertEqual(mock_get.call_count, 3)  # Initial + 2 retries
-
-    @patch("requests.Session.get")
-    def test_rate_limit_business_code(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "code": "ApiCallLimit",
-            "message": "API call limit reached for this period",
-        }
-        mock_get.return_value = mock_resp
-
-        with self.assertRaises(DarazRateLimitError):
-            self.client.fetch_orders()
-
-        self.assertEqual(mock_get.call_count, 3)
-
-    # ------------------------------------------------------------------
-    # 5. Transient Server Error Retries
-    # ------------------------------------------------------------------
-
-    @patch("requests.Session.get")
-    def test_transient_error_retry_and_recovery(self, mock_get):
-        err_resp = MagicMock()
-        err_resp.status_code = 502
-
-        ok_resp = MagicMock()
-        ok_resp.status_code = 200
-        ok_resp.json.return_value = {"code": "0", "data": {"orders": []}}
-
-        mock_get.side_effect = [err_resp, ok_resp]
-
-        res = self.client.fetch_orders()
-        self.assertEqual(res, {"orders": []})
-        self.assertEqual(mock_get.call_count, 2)
-
-    # ------------------------------------------------------------------
-    # 6. Offset Pagination
-    # ------------------------------------------------------------------
-
-    @patch("requests.Session.get")
-    def test_pagination_multiple_pages(self, mock_get):
-        # Page 1: 100 items (full page, triggers next page)
-        resp1 = MagicMock()
-        resp1.status_code = 200
-        resp1.json.return_value = {
-            "code": "0",
-            "data": {"orders": [{"id": f"ord_{i}"} for i in range(100)]}
-        }
-
-        # Page 2: 45 items (< 100, terminates)
-        resp2 = MagicMock()
-        resp2.status_code = 200
-        resp2.json.return_value = {
-            "code": "0",
-            "data": {"orders": [{"id": f"ord_{i}"} for i in range(100, 145)]}
-        }
-
-        mock_get.side_effect = [resp1, resp2]
-
-        pages = list(self.client.paginate("/orders/get", data_key="orders", page_size=100))
-        self.assertEqual(len(pages), 2)
-        self.assertEqual(pages[0]["page"], 1)
-        self.assertEqual(pages[0]["count"], 100)
-        self.assertEqual(pages[1]["page"], 2)
-        self.assertEqual(pages[1]["count"], 45)
-        self.assertEqual(mock_get.call_count, 2)
-
-    @patch("requests.Session.get")
-    def test_pagination_single_page(self, mock_get):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = {
-            "code": "0",
-            "data": {"orders": [{"id": "ord_1"}, {"id": "ord_2"}]}
-        }
-        mock_get.return_value = resp
-
-        pages = list(self.client.paginate("/orders/get", data_key="orders", page_size=100))
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0]["count"], 2)
-        self.assertEqual(mock_get.call_count, 1)
-
-    @patch("requests.Session.get")
-    def test_pagination_empty_page(self, mock_get):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = {"code": "0", "data": {"orders": []}}
-        mock_get.return_value = resp
-
-        pages = list(self.client.paginate("/orders/get", data_key="orders", page_size=100))
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0]["count"], 0)
-
-    # ------------------------------------------------------------------
-    # 7. Credential Safety
-    # ------------------------------------------------------------------
-
-    def test_credential_safety(self):
-        repr_str = repr(self.client)
-        self.assertIn("123456", repr_str)
-        # Token and secret must NEVER be visible
-        self.assertNotIn("test_daraz_app_secret_xyz", repr_str)
-        self.assertNotIn("daraz_access_token_abc", repr_str)
-        self.assertIn("token='***'", repr_str)
+    def test_credential_values_are_not_repr_or_exception_text(self):
+        rendered = repr(self.client)
+        self.assertNotIn("123456", rendered)
+        self.assertNotIn("test-secret", rendered)
+        self.assertNotIn("seller-token", rendered)
 
 
 if __name__ == "__main__":

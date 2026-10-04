@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS core.orders (
     source_platform   TEXT NOT NULL DEFAULT 'shopify',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_order_external UNIQUE (business_id, external_order_id),
+    CONSTRAINT uq_orders_order_business UNIQUE (order_id, business_id),
     CONSTRAINT chk_order_status CHECK (
         order_status IN ('pending','confirmed','fulfilled','delivered','cancelled','returned','rto')
     ),
@@ -199,6 +200,10 @@ CREATE TABLE IF NOT EXISTS core.payment (
     gateway_fee         NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (gateway_fee >= 0),
     paid_at             TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    provider            TEXT,
+    provider_account_identifier TEXT,
+    currency            CHAR(3),
+    original_payment_id BIGINT,
     CONSTRAINT uq_payment_external UNIQUE (business_id, external_payment_id),
     CONSTRAINT chk_pay_method CHECK (
         payment_method IN ('cod','card','bank_transfer','wallet','other')
@@ -206,7 +211,78 @@ CREATE TABLE IF NOT EXISTS core.payment (
     CONSTRAINT chk_pay_type CHECK (payment_type IN ('payment','refund')),
     CONSTRAINT chk_pay_status CHECK (
         payment_status IN ('pending','paid','failed')
-    )
+    ),
+    CONSTRAINT chk_payment_currency_format
+        CHECK (currency IS NULL OR currency ~ '^[A-Z]{3}$'),
+    CONSTRAINT chk_payment_original_is_refund
+        CHECK (original_payment_id IS NULL OR payment_type = 'refund'),
+    CONSTRAINT uq_payment_id_business UNIQUE (payment_id, business_id),
+    CONSTRAINT fk_payment_order_business
+        FOREIGN KEY (order_id, business_id)
+        REFERENCES core.orders (order_id, business_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_payment_original_business
+        FOREIGN KEY (original_payment_id, business_id)
+        REFERENCES core.payment (payment_id, business_id)
+        ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS core.payment_settlement (
+    settlement_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    business_id BIGINT NOT NULL
+        REFERENCES core.business (business_id)
+        ON DELETE RESTRICT,
+    provider TEXT NOT NULL,
+    provider_account_identifier TEXT,
+    external_settlement_id TEXT,
+    currency CHAR(3) NOT NULL,
+    gross_amount NUMERIC(20,6),
+    fee_amount NUMERIC(20,6),
+    adjustment_amount NUMERIC(20,6),
+    net_amount NUMERIC(20,6),
+    status TEXT NOT NULL,
+    settled_at TIMESTAMPTZ,
+    expected_arrival_at TIMESTAMPTZ,
+    provider_status TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_payment_settlement_currency
+        CHECK (currency ~ '^[A-Z]{3}$'),
+    CONSTRAINT chk_payment_settlement_status
+        CHECK (status IN ('pending', 'settled', 'failed', 'cancelled', 'unknown')),
+    CONSTRAINT chk_payment_settlement_gross
+        CHECK (gross_amount IS NULL OR gross_amount >= 0),
+    CONSTRAINT chk_payment_settlement_fee
+        CHECK (fee_amount IS NULL OR fee_amount >= 0),
+    CONSTRAINT uq_payment_settlement_business
+        UNIQUE (settlement_id, business_id)
+);
+
+CREATE TABLE IF NOT EXISTS core.payment_settlement_entry (
+    settlement_entry_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    business_id BIGINT NOT NULL,
+    settlement_id BIGINT NOT NULL,
+    payment_id BIGINT,
+    external_entry_id TEXT,
+    external_transaction_id TEXT,
+    entry_type TEXT NOT NULL,
+    signed_amount NUMERIC(20,6) NOT NULL,
+    currency CHAR(3) NOT NULL,
+    provider_status TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_payment_settlement_entry_type
+        CHECK (entry_type IN ('payment', 'refund', 'fee', 'adjustment', 'reserve', 'other')),
+    CONSTRAINT chk_payment_settlement_entry_currency
+        CHECK (currency ~ '^[A-Z]{3}$'),
+    CONSTRAINT fk_settlement_entry_settlement_business
+        FOREIGN KEY (settlement_id, business_id)
+        REFERENCES core.payment_settlement (settlement_id, business_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_settlement_entry_payment_business
+        FOREIGN KEY (payment_id, business_id)
+        REFERENCES core.payment (payment_id, business_id)
+        ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS core.rto_return (
@@ -225,6 +301,32 @@ CREATE TABLE IF NOT EXISTS core.rto_return (
 
 CREATE INDEX IF NOT EXISTS idx_shipment_order  ON core.shipment (order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_order   ON core.payment (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_provider_account_external
+    ON core.payment (
+        business_id,
+        provider,
+        provider_account_identifier,
+        external_payment_id
+    )
+    WHERE provider IS NOT NULL
+      AND provider_account_identifier IS NOT NULL
+      AND external_payment_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_settlement_provider_external
+    ON core.payment_settlement (
+        business_id,
+        provider,
+        provider_account_identifier,
+        external_settlement_id
+    )
+    WHERE provider_account_identifier IS NOT NULL
+      AND external_settlement_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_entry_external_id
+    ON core.payment_settlement_entry (
+        business_id,
+        settlement_id,
+        external_entry_id
+    )
+    WHERE external_entry_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_return_order    ON core.rto_return (order_id);
 CREATE INDEX IF NOT EXISTS idx_return_shipment ON core.rto_return (shipment_id);
 

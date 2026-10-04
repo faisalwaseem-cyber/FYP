@@ -1,210 +1,190 @@
-"""
-Multi-Tenant Meta Ads Ingestion Pipeline (BRIDGE FLOW — Phase 4.4).
+"""Tenant-scoped Meta Ads ingestion through services, raw storage, ETL, and loader."""
 
-Architecture:
-    Authenticated Business (business_id)
-    → core.platform_connection
-    → CredentialManager               (decrypts tokens, zero leakage)
-    → MetaClient                      (Graph API v26.0)
-    → MetaCampaignService / Insights  (paginated entity and metrics retrieval)
-    → raw.raw_data                    (verbatim JSON persistence)
-    → MetaAdsTransformer              (canonical campaign / spend normalization)
-    → MetaAdsLoader                   (idempotent upsert to core.marketing_campaign + core.ad_spend)
-    → raw.sync_log                    (telemetry)
-    → core.platform_connection        (last_synced_at stamp)
-
-Design invariants:
-    - business_id is strictly propagated through every layer (no cross-tenant leakage).
-    - Credentials resolved via CredentialManager with fallback to env vars.
-    - Idempotent: safe replayability via ON CONFLICT upserts.
-    - Full telemetry: logs to raw.sync_log and updates connection status.
-    - Failed sync marks connection status='error' and records error in raw.sync_log.
-"""
-import os
-import sys
 from datetime import date, timedelta
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from dotenv import load_dotenv
-load_dotenv()
+from typing import Any, Dict, List, Optional, Tuple
 
 from auth.connection_service import list_connections, update_last_synced, update_status
 from auth.credential_manager import CredentialManager
-from config.settings import BUSINESS_ID
-from connectors.meta.client import MetaClient
-from connectors.meta.services import MetaCampaignService, MetaInsightsService
+from config.settings import BUSINESS_ID, META_GRAPH_API_BASE_URL
+from connectors.meta_ads.client import MetaAdsClient, MetaAuthenticationError
+from connectors.meta_ads.services import (
+    MetaAdAccountService,
+    MetaAdService,
+    MetaAdSetService,
+    MetaCampaignService,
+    MetaInsightsService,
+)
 from etl.meta_ads_transformer import MetaAdsTransformer
 from loaders.meta_ads_loader import MetaAdsLoader
 from pipeline.sync_logger import SyncLogger
 from raw_layer.raw_repository import save_raw_payload
 
 
-def resolve_meta_credentials(business_id: int) -> Tuple[str, str, Optional[str], Optional[int]]:
-    """
-    Resolves decrypted Meta credentials for the specified business.
-    First checks core.platform_connection (platform='meta' or 'meta_ads').
-    Falls back to environment variables if no database connection is present.
+def resolve_meta_credentials(
+    business_id: int,
+    account_identifier: Optional[str] = None,
+) -> Tuple[str, str, None, int]:
+    """Resolve one active Meta token only through the encrypted connection registry."""
+    connections = [
+        connection
+        for connection in list_connections(business_id)
+        if connection["platform"] == "meta_ads" and connection["status"] == "active"
+    ]
+    if account_identifier is not None:
+        connections = [
+            connection for connection in connections
+            if connection["account_identifier"] == account_identifier
+        ]
+    if len(connections) != 1:
+        raise ValueError("Select one active Meta ad account connection for this business.")
 
-    Returns:
-        (access_token, ad_account_id, app_secret, connection_id)
-
-    Raises:
-        ValueError — if no connection and no environment credentials are found.
-    """
-    cm = CredentialManager()
-    conns = list_connections(business_id)
-    meta_conn = next(
-        (c for c in conns if c["platform"] in ("meta", "meta_ads") and c["status"] in ("active", "error")),
-        None,
+    connection = connections[0]
+    credentials = CredentialManager().get_valid_credentials(
+        business_id=business_id,
+        platform="meta_ads",
+        account_identifier=connection["account_identifier"],
+        refresh_callback=None,
     )
-
-    if meta_conn:
-        creds = cm.get_valid_credentials(
-            business_id=business_id,
-            platform=meta_conn["platform"],
-            account_identifier=meta_conn["account_identifier"],
-        )
-        token = creds.get("access_token", "")
-        acc_id = (
-            creds.get("account_identifier")
-            or creds.get("ad_account_id")
-            or (creds.get("additional_credentials") or {}).get("ad_account_id", "")
-        )
-        secret = creds.get("app_secret") or (creds.get("additional_credentials") or {}).get("app_secret")
-        if not token:
-            raise ValueError(f"Meta connection for business_id={business_id} is missing access_token.")
-        return token, str(acc_id), secret, meta_conn["connection_id"]
-
-    # Fallback to environment variables
-    env_token = os.getenv("META_ACCESS_TOKEN", "").strip()
-    env_acc_id = os.getenv("META_AD_ACCOUNT_ID", "").strip()
-    env_secret = os.getenv("META_APP_SECRET", "").strip() or None
-
-    _PLACEHOLDERS = ("xxxxxxxx", "your_", "<", "placeholder", "changeme")
-    token_is_real = env_token and not any(p in env_token.lower() for p in _PLACEHOLDERS)
-    acc_id_is_real = env_acc_id and not any(p in env_acc_id.lower() for p in _PLACEHOLDERS)
-
-    if token_is_real and acc_id_is_real:
-        return env_token, env_acc_id, env_secret, None
-
-    raise ValueError(
-        f"No active Meta Ads connection or valid environment credentials found for business_id={business_id}. "
-        "Set META_ACCESS_TOKEN and META_AD_ACCOUNT_ID in your .env file with real values, "
-        "or connect your Meta Ad Account via the platform connection API."
+    access_token = credentials.get("access_token")
+    if not access_token:
+        raise ValueError("Meta access token is unavailable for this connection.")
+    return (
+        access_token,
+        connection["account_identifier"],
+        None,
+        connection["connection_id"],
     )
 
 
 def run_meta_ads_sync(
     business_id: int = BUSINESS_ID,
     days_back: int = 7,
+    account_identifier: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Fetches Meta Ads campaigns and daily insights for the given business.
-    Pipes through: Services → Raw → Transformer → Loader.
+    """Sync active Meta account connections for one server-resolved business."""
+    if isinstance(business_id, bool) or not isinstance(business_id, int) or business_id <= 0:
+        raise ValueError("business_id must be a positive server-resolved integer.")
+    if isinstance(days_back, bool) or not isinstance(days_back, int) or not 1 <= days_back <= 90:
+        raise ValueError("days_back must be between 1 and 90.")
 
-    Returns a summary dict with telemetry counters.
-    """
-    if not business_id or business_id <= 0:
-        raise ValueError(f"Invalid business_id: {business_id}")
+    connections = [
+        connection
+        for connection in list_connections(business_id)
+        if connection["platform"] == "meta_ads" and connection["status"] == "active"
+    ]
+    if account_identifier is not None:
+        connections = [
+            connection for connection in connections
+            if connection["account_identifier"] == account_identifier
+        ]
+    if not connections:
+        raise ValueError("No active Meta ad account connection was found for this business.")
 
     today = date.today()
-    since_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    until_date = today.strftime("%Y-%m-%d")
-
+    since_date = (today - timedelta(days=days_back)).isoformat()
+    until_date = today.isoformat()
     logger = SyncLogger(business_id=business_id, source="meta_ads")
     logger.start_sync(sync_type=f"meta_ads_{days_back}d_sync")
 
-    conn_id: Optional[int] = None
+    fetched_count = 0
+    inserted_count = 0
+    updated_count = 0
+    campaigns_count = 0
+    insights_count = 0
+    current_connection_id: Optional[int] = None
+
     try:
-        access_token, ad_account_id, app_secret, conn_id = resolve_meta_credentials(business_id)
-
-        print("=" * 70)
-        print(f"[*] Starting Meta Ads Sync (business_id={business_id}, Account: {ad_account_id})")
-        print(f"[*] Date Range: {since_date} to {until_date} ({days_back} days)")
-        print("=" * 70)
-
-        client = MetaClient(
-            access_token=access_token,
-            ad_account_id=ad_account_id,
-            app_secret=app_secret,
-        )
-        campaign_service = MetaCampaignService(client)
-        insights_service = MetaInsightsService(client)
         transformer = MetaAdsTransformer(business_id=business_id)
         loader = MetaAdsLoader(business_id=business_id)
+        for connection in connections:
+            connection_id = connection.get("connection_id")
+            connected_account_identifier = connection.get("account_identifier")
+            if not isinstance(connection_id, int) or isinstance(connection_id, bool):
+                raise ValueError("Meta connection is missing a valid connection_id.")
+            if not isinstance(connected_account_identifier, str) or not connected_account_identifier:
+                raise ValueError("Meta connection is missing an account identifier.")
+            current_connection_id = connection_id
+            client = MetaAdsClient(
+                business_id=business_id,
+                account_identifier=connected_account_identifier,
+                ad_account_id=connected_account_identifier,
+                base_url=META_GRAPH_API_BASE_URL,
+            )
+            account_context = {"account_identifier": connected_account_identifier}
 
-        # ------------------------------------------------------------------
-        # Step 1: Campaigns (Services → Raw → Transformer → Loader)
-        # ------------------------------------------------------------------
-        print("[*] Step 1: Fetching campaigns from Meta Graph API...")
-        campaigns_raw_records = []
-        for page in campaign_service.fetch_campaigns():
-            raw_resp = page.get("raw_response", {})
-            save_raw_payload(business_id, "meta_ads", "campaigns", raw_resp)
-            campaigns_raw_records.extend(page.get("campaigns", []))
+            raw_by_type: Dict[str, List[Dict[str, Any]]] = {}
 
-        df_campaigns = transformer.transform_campaigns(campaigns_raw_records)
-        campaigns_loaded = loader.load_campaigns(df_campaigns)
-        print(f"[OK] Campaigns Synced: {campaigns_loaded} loaded/updated.")
+            def fetch_and_preserve(data_type: str, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                nonlocal fetched_count
+                raw_records = [dict(record) for record in records]
+                raw_by_type[data_type] = raw_records
+                fetched_count += len(raw_records)
+                save_raw_payload(
+                    business_id,
+                    "meta_ads",
+                    data_type,
+                    {**account_context, "data": raw_records},
+                )
+                return raw_records
 
-        # ------------------------------------------------------------------
-        # Step 2: Daily Insights (Services → Raw → Transformer → Loader)
-        # ------------------------------------------------------------------
-        print(f"[*] Step 2: Fetching daily insights for {since_date} to {until_date}...")
-        insights_raw_records = []
-        for page in insights_service.fetch_insights(
-            level="campaign",
-            since=since_date,
-            until=until_date,
-            time_increment=1,
-        ):
-            raw_resp = page.get("raw_response", {})
-            save_raw_payload(business_id, "meta_ads", "daily_insights", raw_resp)
-            insights_raw_records.extend(page.get("insights", []))
+            account_service = MetaAdAccountService(client)
+            campaign_service = MetaCampaignService(client)
+            ad_set_service = MetaAdSetService(client)
+            ad_service = MetaAdService(client)
+            insights_service = MetaInsightsService(client)
 
-        df_insight_campaigns, df_spend = transformer.transform_daily_insights(insights_raw_records)
-        if not df_insight_campaigns.empty:
-            loader.load_campaigns(df_insight_campaigns)
+            fetch_and_preserve("ad_accounts", account_service.fetch_accounts())
+            raw_by_type["campaigns"] = fetch_and_preserve(
+                "campaigns", campaign_service.fetch_campaigns()
+            )
+            fetch_and_preserve("ad_sets", ad_set_service.fetch_ad_sets())
+            fetch_and_preserve("ads", ad_service.fetch_ads())
+            fetch_and_preserve("ad_creatives", ad_service.fetch_creatives())
+            raw_by_type["insights"] = fetch_and_preserve(
+                "insights",
+                insights_service.fetch_insights(
+                    level="campaign",
+                    since=since_date,
+                    until=until_date,
+                    time_increment=1,
+                ),
+            )
 
-        inserted, updated = loader.load_ad_spend(df_spend)
-        print(f"[OK] Daily Ad Spend loaded: {inserted} inserted, {updated} updated.")
+            campaign_frame = transformer.transform_campaigns(raw_by_type["campaigns"])
+            campaigns_count += len(campaign_frame)
+            inserted_count += loader.load_campaigns(campaign_frame)
 
-        # ------------------------------------------------------------------
-        # Step 3: Telemetry & State Updates
-        # ------------------------------------------------------------------
-        total_fetched = len(campaigns_raw_records) + len(insights_raw_records)
+            _, spend_frame = transformer.transform_insights(
+                raw_by_type["insights"], level="campaign"
+            )
+            insights_count += len(raw_by_type["insights"])
+            spend_inserted, spend_updated = loader.load_ad_spend(spend_frame)
+            inserted_count += spend_inserted
+            updated_count += spend_updated
+            update_last_synced(connection_id)
+
         logger.finish_success(
-            fetched=total_fetched,
-            inserted=inserted + campaigns_loaded,
-            updated=updated,
+            fetched=fetched_count,
+            inserted=inserted_count,
+            updated=updated_count,
         )
-
-        if conn_id is not None:
-            update_last_synced(conn_id)
-            update_status(conn_id, "active")
-
-        print("=" * 70)
-        print("[SUCCESS] Meta Ads sync completed successfully!")
-        print("=" * 70)
         return {
             "status": "success",
             "business_id": business_id,
-            "ad_account_id": ad_account_id,
-            "date_range": f"{since_date} to {until_date}",
-            "campaigns_synced": len(df_campaigns),
-            "insights_fetched": len(insights_raw_records),
-            "spend_inserted": inserted,
-            "spend_updated": updated,
+            "accounts_synced": len(connections),
+            "campaigns_synced": campaigns_count,
+            "insights_fetched": insights_count,
+            "spend_inserted": inserted_count - campaigns_count,
+            "spend_updated": updated_count,
+            "date_range": {"since": since_date, "until": until_date},
         }
-
-    except Exception as e:
-        logger.finish_failure(str(e))
-        if conn_id is not None:
-            update_status(conn_id, "error", error_message=str(e))
-        print(f"[!] Meta Ads sync failed: {e}")
+    except Exception as exc:
+        logger.finish_failure(str(exc))
+        if current_connection_id is not None and not isinstance(exc, MetaAuthenticationError):
+            try:
+                update_status(current_connection_id, "error", error_message=str(exc))
+            except Exception:
+                pass
         raise
 
 

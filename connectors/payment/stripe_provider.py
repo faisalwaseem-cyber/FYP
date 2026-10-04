@@ -1,15 +1,4 @@
-"""
-Stripe Payment & Settlement Provider — BRIDGE FLOW Phase 6
-==========================================================
-
-Integration methods supported:
-- REST API (GET /v1/charges, GET /v1/refunds, GET /v1/payouts)
-- CSV Export parsing (Stripe payments and balance statements)
-
-Fee Calculation:
-- Standard card MDR: 2.9% (or application_fee_amount from API / fee column from CSV)
-- Exact Net Received = Amount - Gateway Fee
-"""
+"""Offline parsing helpers for supplied Stripe transaction exports."""
 from __future__ import annotations
 
 import csv
@@ -28,132 +17,100 @@ from connectors.payment.base import (
 )
 
 
+def _currency(value: Any) -> Optional[str]:
+    if isinstance(value, str) and len(value.strip()) == 3:
+        return value.strip().upper()
+    return None
+
+
+def _account(row: Dict[str, Any]) -> Optional[str]:
+    value = row.get("provider_account_identifier")
+    return str(value).strip() if value is not None and str(value).strip() else None
+
+
 class StripePaymentProvider(BasePaymentProvider):
-    PROVIDER_NAME: str = "stripe"
+    PROVIDER_NAME = "stripe"
     SUPPORTED_METHODS = {"api", "csv", "settlement"}
 
-    def __init__(self, default_fee_rate: float = 0.029):
-        # 2.9% default card fee
-        super().__init__(default_fee_rate=default_fee_rate)
-
-    def parse_transactions(self, raw_data: Union[List[Dict[str, Any]], str]) -> List[PaymentRecord]:
-        """
-        Parses either:
-        - List of dicts (from Stripe API charges/refunds endpoint)
-        - CSV string (from Stripe dashboard export)
-        """
+    def parse_transactions(self, raw_data: Union[List[Dict[str, Any]], Dict[str, Any], str]) -> List[PaymentRecord]:
         if isinstance(raw_data, str):
-            # Check if JSON string or CSV
             stripped = raw_data.strip()
-            if stripped.startswith("[") or stripped.startswith("{"):
+            if stripped.startswith(("[", "{")):
                 parsed = json.loads(stripped)
-                if isinstance(parsed, dict) and "data" in parsed:
-                    return self._parse_api_charges(parsed["data"])
-                elif isinstance(parsed, list):
-                    return self._parse_api_charges(parsed)
+                if isinstance(parsed, dict):
+                    return self.parse_transactions(parsed.get("data", []))
+                if isinstance(parsed, list):
+                    return self._parse_api_transactions(parsed)
             return self._parse_csv(raw_data)
-        elif isinstance(raw_data, list):
-            return self._parse_api_charges(raw_data)
-        elif isinstance(raw_data, dict) and "data" in raw_data:
-            return self._parse_api_charges(raw_data["data"])
+        if isinstance(raw_data, list):
+            return self._parse_api_transactions(raw_data)
+        if isinstance(raw_data, dict) and isinstance(raw_data.get("data"), list):
+            return self._parse_api_transactions(raw_data["data"])
         return []
 
-    def _parse_api_charges(self, charges: List[Dict[str, Any]]) -> List[PaymentRecord]:
-        records: List[PaymentRecord] = []
-        for ch in charges:
-            # Order matching: check metadata.order_id, shopify_order_id, or transfer_group
-            metadata = ch.get("metadata") or {}
-            ext_order_id = str(
-                metadata.get("order_id")
-                or metadata.get("shopify_order_id")
-                or ch.get("transfer_group")
-                or ch.get("description")
-                or ""
-            ).strip()
-
-            if not ext_order_id:
-                # If no order id in metadata, check if id can be used or skip
-                ext_order_id = ch.get("id", "")
-
-            amount = safe_parse_money(ch.get("amount", 0))
-
-            # Gateway fee from application_fee_amount or estimate
-            fee_raw = ch.get("application_fee_amount")
-            if fee_raw is not None:
-                fee = safe_parse_money(fee_raw)
+    def _parse_api_transactions(self, items: List[Dict[str, Any]]) -> List[PaymentRecord]:
+        records = []
+        for item in items:
+            metadata = item.get("metadata") or {}
+            object_type = item.get("object")
+            if object_type == "refund":
+                payment_type = "refund"
+                original_id = item.get("charge")
+            elif object_type == "charge":
+                payment_type = "payment"
+                original_id = None
             else:
-                fee = self.calculate_fee(amount, method="card")
+                payment_type = normalize_type(item.get("type"))
+                original_id = item.get("charge") if payment_type == "refund" else None
 
-            # Paid at timestamp
+            created = item.get("created")
             paid_at = None
-            created = ch.get("created")
-            if created:
-                if isinstance(created, (int, float)):
-                    paid_at = datetime.fromtimestamp(int(created), tz=timezone.utc).isoformat()
-                else:
-                    paid_at = str(created)
+            if isinstance(created, (int, float)):
+                paid_at = datetime.fromtimestamp(int(created), tz=timezone.utc).isoformat()
+            elif created:
+                paid_at = str(created)
 
-            # Payment type & status
-            amount_refunded = safe_parse_money(ch.get("amount_refunded", 0))
-            is_refund = (amount_refunded >= amount and amount > 0)
-            pay_type = "refund" if is_refund else "payment"
-
-            status = normalize_status(ch.get("status", "paid"))
-
+            method_details = item.get("payment_method_details") or {}
+            method = normalize_method(
+                method_details.get("type") or item.get("payment_method")
+            )
+            fee_value = item.get("gateway_fee")
             records.append(PaymentRecord(
-                external_payment_id=ch.get("id"),
-                external_order_id=ext_order_id,
-                amount=amount,
-                gateway_fee=fee,
-                payment_method="card",
-                payment_type=pay_type,
-                payment_status=status,
-                settlement_status="settled" if status == "paid" else "pending",
+                external_order_id=str(metadata.get("order_id") or metadata.get("shopify_order_id") or "").strip() or None,
+                amount=safe_parse_money(item.get("canonical_amount")),
+                gateway_fee=safe_parse_money(fee_value),
+                external_payment_id=str(item["id"]).strip() if item.get("id") else None,
+                payment_method=method,
+                payment_type=payment_type,
+                payment_status=normalize_status(item.get("status")),
                 paid_at=paid_at,
-                currency=str(ch.get("currency", "PKR")).upper(),
-                gateway_name=self.PROVIDER_NAME,
-                raw_metadata=ch,
+                currency=_currency(item.get("currency")),
+                provider=self.PROVIDER_NAME,
+                provider_account_identifier=_account(item),
+                original_external_payment_id=str(original_id).strip() if original_id else None,
+                raw_metadata=item,
             ))
         return records
 
     def _parse_csv(self, csv_content: str) -> List[PaymentRecord]:
-        records: List[PaymentRecord] = []
-        reader = csv.DictReader(io.StringIO(csv_content.strip()))
-        for row in reader:
-            # Flexible column lookup
-            ext_payment_id = row.get("id") or row.get("Transaction ID") or row.get("payment_id")
-            ext_order_id = (
-                row.get("order_id")
-                or row.get("Description")
-                or row.get("Order ID")
-                or row.get("metadata_order_id")
-                or ""
-            ).strip()
-
-            amount = safe_parse_money(row.get("Amount") or row.get("amount", 0))
-            fee_raw = row.get("Fee") or row.get("fee") or row.get("gateway_fee")
-            if fee_raw is not None and str(fee_raw).strip():
-                fee = safe_parse_money(fee_raw)
-            else:
-                fee = self.calculate_fee(amount, method="card")
-
-            status = normalize_status(row.get("Status") or row.get("status", "paid"))
-            pay_type = normalize_type(row.get("Type") or row.get("type", "payment"))
-            paid_at = row.get("Created (UTC)") or row.get("created") or row.get("paid_at")
-
+        records = []
+        for row in csv.DictReader(io.StringIO(csv_content.strip())):
+            payment_id = row.get("external_payment_id")
+            order_id = row.get("external_order_id")
+            created = row.get("paid_at")
             records.append(PaymentRecord(
-                external_payment_id=ext_payment_id,
-                external_order_id=ext_order_id,
-                amount=amount,
-                gateway_fee=fee,
-                payment_method="card",
-                payment_type=pay_type,
-                payment_status=status,
-                settlement_status="settled" if status == "paid" else "pending",
-                paid_at=str(paid_at).strip() if paid_at else None,
-                currency="PKR",
-                gateway_name=self.PROVIDER_NAME,
+                external_order_id=str(order_id).strip() if order_id and str(order_id).strip() else None,
+                amount=safe_parse_money(row.get("amount")),
+                gateway_fee=safe_parse_money(row.get("gateway_fee")),
+                external_payment_id=str(payment_id).strip() if payment_id and str(payment_id).strip() else None,
+                payment_method=normalize_method(row.get("payment_method")),
+                payment_type=normalize_type(row.get("payment_type")),
+                payment_status=normalize_status(row.get("payment_status")),
+                paid_at=str(created).strip() if created else None,
+                currency=_currency(row.get("currency")),
+                provider=self.PROVIDER_NAME,
+                provider_account_identifier=_account(row),
+                original_external_payment_id=row.get("original_payment_id") or None,
                 raw_metadata=dict(row),
             ))
         return records
-

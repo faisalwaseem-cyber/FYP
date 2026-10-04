@@ -1,46 +1,75 @@
-"""
-Payment & Settlement Ingestion Pipeline Runner — BRIDGE FLOW Phase 6
-===================================================================
-
-Orchestrates the ingestion of payment and settlement data across providers:
-- Stripe API (online credit/debit card charges & fees)
-- PayFast Pakistan (portal settlement CSV/Excel exports)
-- JazzCash (merchant statement exports)
-- EasyPaisa (merchant statement exports)
-- COD Reconciliation (courier COD remittance & settlement matching)
-- Manual / Bank Transfers (IBFT / Raast / Kuickpay statement imports)
-
-Canonical Objective:
-Order → Payment → Gateway Fee → Settlement → Net Received
-
-Pipeline Flow:
-Provider Selection
-→ Raw Layer (save_raw_payload)
-→ PaymentTransformer (canonical normalization & net received computation)
-→ PaymentLoader (core.payment idempotent upsert)
-→ SyncLogger (raw.sync_log telemetry)
-
-Invariants:
-- business_id is strictly propagated through all layers.
-- Duplicate prevention via unique constraint (business_id, external_payment_id).
-- Final profit calculation is decoupled and deferred (Phase 7+).
-"""
+"""Offline payment ingestion orchestration with tenant-scoped raw auditing."""
 from __future__ import annotations
 
+import csv
+import io
+import json
+import re
 import sys
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from config.settings import BUSINESS_ID
-from connectors.payment.base import PaymentRecord, SettlementBatch
+from connectors.payment.base import PaymentRecord
 from connectors.payment.provider_factory import get_payment_provider
-from connectors.payment.stripe_provider import StripePaymentProvider
 from etl.payment_transformer import PaymentTransformer
 from loaders.payment_loader import PaymentLoader
 from pipeline.sync_logger import SyncLogger
 from raw_layer.raw_repository import save_raw_payload
+
+_SENSITIVE_KEY_PARTS = (
+    "token", "secret", "password", "authorization", "apikey",
+    "clientkey", "signature", "credential",
+)
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+    r"authorization|password|webhook[_-]?secret)\s*[:=]\s*)"
+    r"((?:bearer\s+)?[^,\s;&]+)"
+)
+
+
+def _sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+
+
+def _redact_raw_payload(value: Any) -> Any:
+    """Preserve the source structure while removing credential-shaped fields."""
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if _sensitive_key(key) else _redact_raw_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_raw_payload(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return _redact_raw_payload(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
+        if "\n" in value and "," in value:
+            reader = csv.DictReader(io.StringIO(value))
+            if reader.fieldnames and any(_sensitive_key(name) for name in reader.fieldnames):
+                return {
+                    "format": "redacted_csv",
+                    "records": _redact_raw_payload(list(reader)),
+                }
+        return _SENSITIVE_TEXT.sub(r"\1[REDACTED]", value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)
 
 
 def run_payment_sync(
@@ -48,87 +77,75 @@ def run_payment_sync(
     raw_payload: Any,
     sync_type: str = "statement_sync",
     business_id: int = BUSINESS_ID,
+    settlement_record: Optional[Dict[str, Any]] = None,
+    settlement_entries: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Ingests payments and settlements from any supported provider using the provider abstraction.
-
-    Parameters
-    ----------
-    provider_name : str
-        'stripe' | 'payfast' | 'jazzcash' | 'easypaisa' | 'cod' | 'manual'
-    raw_payload : Any
-        CSV text, JSON string, dict list, or API response.
-    sync_type : str
-        Identifier written to raw.sync_log.
-    business_id : int
-        Tenant identifier.
-    """
+    """Import supplied payment data; provider network calls are not performed here."""
+    if not isinstance(business_id, int) or business_id <= 0:
+        raise ValueError("business_id must be resolved by trusted server-side code.")
+    provider = get_payment_provider(provider_name)
     logger = SyncLogger(business_id, f"payment_{provider_name}")
-    sync_id = logger.start_sync(sync_type=sync_type)
+    logger.start_sync(sync_type=sync_type)
     loader = PaymentLoader(business_id)
     transformer = PaymentTransformer(business_id)
 
     try:
-        # Step 1: Resolve provider & parse transactions
-        provider = get_payment_provider(provider_name)
-        records: List[PaymentRecord] = provider.parse_transactions(raw_payload)
-        records_fetched = len(records)
-
-        # Step 2: Save raw data to raw.raw_data
-        raw_id = save_raw_payload(
+        # Keep the original response in the tenant-scoped raw layer before parsing.
+        audited_payload: Dict[str, Any] = {
+            "provider_response": _redact_raw_payload(raw_payload)
+        }
+        if settlement_record is not None:
+            audited_payload["settlement_response"] = _redact_raw_payload(settlement_record)
+        if settlement_entries is not None:
+            audited_payload["settlement_entries_response"] = _redact_raw_payload(
+                settlement_entries
+            )
+        raw_payload_id = save_raw_payload(
             business_id=business_id,
             source="payment_gateway",
-            data_type=f"{provider_name}_settlement",
-            payload={"records": [r.to_dict() for r in records]} if records else {"raw": str(raw_payload)[:1000]},
+            data_type=f"{provider_name}_response",
+            payload=audited_payload,
         )
 
-        # Step 3: Transform and match to orders
+        records: List[PaymentRecord] = provider.parse_transactions(raw_payload)
         order_map = loader.get_order_id_map()
-        df_payments = transformer.transform_payment_records(records, order_map)
+        payment_context = loader.get_payment_context_map()
+        canonical_payments = transformer.transform_payment_records(
+            records,
+            order_map,
+            original_payment_map=payment_context,
+        )
+        inserted, updated = loader.load_payments(canonical_payments)
 
-        # Step 4: Load into core.payment (idempotent upsert)
-        inserted, updated = loader.load_payments(df_payments)
+        settlement_id = None
+        if settlement_record is not None:
+            settlement_id, _ = loader.load_settlement(
+                settlement_record,
+                list(settlement_entries or []),
+            )
 
-        # Step 5: Compute Net Received metrics
-        total_gross = float(df_payments["amount"].sum()) if not df_payments.empty else 0.0
-        total_fees = float(df_payments["gateway_fee"].sum()) if not df_payments.empty else 0.0
-        net_received = round(total_gross - total_fees, 2)
-
-        # Step 6: Log telemetry
         logger.finish_success(
-            fetched=records_fetched,
+            fetched=len(records),
             inserted=inserted,
             updated=updated,
         )
-
-        print(
-            f"[OK] {provider_name.upper()} payment sync completed: "
-            f"{inserted} inserted, {updated} updated, "
-            f"Gross: PKR {total_gross:.2f}, Fees: PKR {total_fees:.2f}, Net: PKR {net_received:.2f}"
-        )
-
         return {
             "status": "success",
             "business_id": business_id,
             "provider": provider_name,
-            "raw_id": raw_id,
-            "records_fetched": records_fetched,
+            "raw_id": raw_payload_id,
+            "records_fetched": len(records),
             "records_inserted": inserted,
             "records_updated": updated,
-            "total_gross": total_gross,
-            "total_fees": total_fees,
-            "net_received": net_received,
+            "records_retained_raw_only": len(transformer.rejected_records),
+            "settlement_id": settlement_id,
         }
-
-    except Exception as e:
-        logger.finish_failure(error_msg=str(e))
-        print(f"[ERROR] Payment sync failed for {provider_name}: {e}")
+    except Exception as error:
+        safe_error = _SENSITIVE_TEXT.sub(r"\1[REDACTED]", str(error))
+        logger.finish_failure(error_msg=safe_error)
+        print(f"[ERROR] Payment sync failed for {provider_name}: {safe_error}")
         raise
 
-
-# ---------------------------------------------------------------------------
-# Backward-compatible convenience functions
-# ---------------------------------------------------------------------------
 
 def run_payment_csv_sync(
     csv_content: str,
@@ -136,7 +153,6 @@ def run_payment_csv_sync(
     sync_type: str = "csv_import",
     business_id: int = BUSINESS_ID,
 ) -> Dict[str, Any]:
-    """Compatibility runner for CSV settlement uploads."""
     return run_payment_sync(
         provider_name=gateway_name,
         raw_payload=csv_content,
@@ -150,19 +166,4 @@ def run_stripe_sync(
     created_after: Optional[int] = None,
     business_id: int = BUSINESS_ID,
 ) -> Dict[str, Any]:
-    """Compatibility runner for live Stripe API syncing."""
-    if not secret_key:
-        print("[INFO] No Stripe secret key provided. Skipping live Stripe API sync.")
-        return {"status": "skipped", "reason": "no_credentials"}
-
-    from connectors.payment.stripe_client import StripeClient
-    client = StripeClient(secret_key=secret_key)
-    charges = client.fetch_charges(created_after=created_after)
-
-    return run_payment_sync(
-        provider_name="stripe",
-        raw_payload=charges,
-        sync_type="api_sync",
-        business_id=business_id,
-    )
-
+    raise RuntimeError("Stripe synchronization is outside the Pakistan payment scope.")

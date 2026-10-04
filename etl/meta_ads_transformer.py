@@ -1,201 +1,192 @@
-"""
-Production-Ready Meta Ads Transformer for BRIDGE FLOW (Phase 4.3).
+"""Transform supported Meta Ads records to the existing canonical schema."""
 
-Transforms Meta Marketing API Graph API v26.0 payloads into canonical relational DataFrames:
-1. Campaigns: core.marketing_campaign (business_id, external_campaign_id, campaign_name, campaign_status)
-2. Daily Ad Spend: core.ad_spend (business_id, external_campaign_id, spend_date, spend_amount,
-   impressions, clicks, purchases, purchase_value)
-
-Design invariants:
-- Strictly scoped by business_id (no cross-tenant leakage).
-- Idempotent: duplicates dropped on unique keys prior to database ingestion.
-- Canonical status normalization ('active', 'paused', 'archived').
-- Handles multi-attribution conversion action types (pixel, omni, onsite).
-- Monetary precision: non-negative floats/decimals rounded to 2 decimal places.
-"""
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from collections.abc import Iterable, Mapping
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-
-def normalize_meta_status(raw_status: Optional[str]) -> str:
-    """
-    Standardizes Meta campaign status into canonical enum:
-    ('active', 'paused', 'archived').
-    """
-    if not raw_status:
-        return "paused"
-    s = str(raw_status).strip().upper()
-    if s == "ACTIVE":
-        return "active"
-    elif s in ("ARCHIVED", "DELETED"):
-        return "archived"
-    return "paused"
+from etl.normalizers import normalize_date
 
 
-def parse_meta_money(val: Any) -> float:
-    """Safely converts spend/currency values to float rounded to 2 decimal places."""
-    if val is None or val == "":
-        return 0.0
-    try:
-        d = Decimal(str(val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return max(0.0, float(d))
-    except Exception:
-        return 0.0
-
-
-def parse_meta_int(val: Any) -> int:
-    """Safely converts impression/click counts to non-negative integer."""
-    if val is None or val == "":
-        return 0
-    try:
-        return max(0, int(float(str(val))))
-    except Exception:
-        return 0
-
-
-# Recognized conversion action types in Meta Ads Graph API
-PURCHASE_ACTION_TYPES = {
-    "purchase",
-    "omni_purchase",
-    "offsite_conversion.fb_pixel_purchase",
-    "onsite_web_purchase",
-    "web_in_store_purchase",
+_CAMPAIGN_COLUMNS = [
+    "business_id", "external_campaign_id", "campaign_name", "campaign_status"
+]
+_SPEND_COLUMNS = [
+    "business_id", "external_campaign_id", "spend_date", "spend_amount",
+    "impressions", "clicks",
+]
+_CENT = Decimal("0.01")
+_MAX_NUMERIC_12_2 = Decimal("9999999999.99")
+_MAX_BIGINT = 9223372036854775807
+_STATUS_MAP = {
+    "ACTIVE": "active",
+    "PAUSED": "paused",
+    "ARCHIVED": "archived",
+    "DELETED": "archived",
 }
 
 
+def normalize_meta_status(raw_status: Optional[str]) -> Optional[str]:
+    """Map only Meta statuses compatible with the campaign CHECK constraint."""
+    if not isinstance(raw_status, str):
+        return None
+    return _STATUS_MAP.get(raw_status.strip().upper())
+
+
+def parse_meta_money(value: Any) -> Optional[Decimal]:
+    """Parse a valid non-negative NUMERIC(12,2) value without inventing zero."""
+    if value is None or isinstance(value, bool) or not str(value).strip():
+        return None
+    try:
+        amount = Decimal(str(value).strip().replace(",", ""))
+        if not amount.is_finite() or amount < 0:
+            return None
+        amount = amount.quantize(_CENT, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return amount if amount <= _MAX_NUMERIC_12_2 else None
+
+
+def parse_meta_int(value: Any) -> Optional[int]:
+    """Parse a non-negative integral Meta metric without truncation/defaulting."""
+    if value is None or isinstance(value, bool) or not str(value).strip():
+        return None
+    try:
+        number = Decimal(str(value).strip().replace(",", ""))
+        if not number.is_finite() or number < 0 or number != number.to_integral_value():
+            return None
+        result = int(number)
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        return None
+    return result if result <= _MAX_BIGINT else None
+
+
+def _identifier(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 class MetaAdsTransformer:
-    """
-    Transforms Meta Marketing API Graph payloads into canonical DataFrames.
-    Guarantees tenant isolation via mandatory business_id.
-    """
+    """Create schema-compatible campaign and campaign-day frames for one tenant."""
 
     def __init__(self, business_id: int):
-        if not business_id or business_id <= 0:
-            raise ValueError(f"Invalid business_id: {business_id}. Must be positive integer.")
-        self.business_id = int(business_id)
+        if isinstance(business_id, bool) or not isinstance(business_id, int) or business_id <= 0:
+            raise ValueError("business_id must be a positive server-resolved integer.")
+        self.business_id = business_id
+        self.rejected_records: List[Dict[str, Optional[str]]] = []
 
-    def transform_campaigns(
-        self,
-        raw_campaigns: Union[List[Dict[str, Any]], Generator[Dict[str, Any], None, None]],
-    ) -> pd.DataFrame:
-        """
-        Transforms campaign records into canonical core.marketing_campaign schema.
-        Accepts either a list of campaign dicts or service page yields.
-        """
-        campaigns_list: List[Dict[str, Any]] = []
+    def _reject(self, record_type: str, external_id: Any, reason: str) -> None:
+        self.rejected_records.append({
+            "record_type": record_type,
+            "external_id": _identifier(external_id),
+            "reason": reason,
+        })
 
-        # Flatten if generator of pages
-        items: List[Dict[str, Any]] = []
-        if isinstance(raw_campaigns, list):
-            items = raw_campaigns
-        else:
-            for page in raw_campaigns:
-                items.extend(page.get("campaigns", page.get("data", [])))
+    def _records(self, values: Any, record_type: str) -> List[Mapping]:
+        if isinstance(values, Mapping):
+            values = values.get("data")
+        if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+            self._reject(record_type, None, "provider response is not a record collection")
+            return []
 
-        for c in items:
-            ext_id = str(c.get("id") or "").strip()
-            if not ext_id:
+        records: List[Mapping] = []
+        for item in values:
+            if isinstance(item, Mapping):
+                if "data" in item and not ("id" in item or "campaign_id" in item):
+                    records.extend(self._records(item.get("data", []), record_type))
+                else:
+                    records.append(item)
+            else:
+                self._reject(record_type, None, "provider record is not an object")
+        return records
+
+    def transform_campaigns(self, raw_campaigns: Any) -> pd.DataFrame:
+        """Transform campaign objects; unsupported statuses/required fields are rejected."""
+        self.rejected_records = []
+        rows: List[Dict[str, Any]] = []
+        for campaign in self._records(raw_campaigns, "campaign"):
+            external_id = _identifier(campaign.get("id"))
+            name = campaign.get("name")
+            status_value = campaign.get("effective_status") or campaign.get("status")
+            status = normalize_meta_status(status_value)
+            if not external_id or not isinstance(name, str) or not name.strip() or status is None:
+                self._reject("campaign", external_id, "missing or unsupported required id, name, or status")
                 continue
-
-            name = str(c.get("name") or f"Campaign {ext_id}").strip()
-            raw_status = c.get("effective_status") or c.get("status")
-            status = normalize_meta_status(raw_status)
-
-            campaigns_list.append({
+            rows.append({
                 "business_id": self.business_id,
-                "external_campaign_id": ext_id,
-                "campaign_name": name,
+                "external_campaign_id": external_id,
+                "campaign_name": name.strip(),
                 "campaign_status": status,
             })
+        return pd.DataFrame(rows, columns=_CAMPAIGN_COLUMNS).drop_duplicates(
+            subset=["business_id", "external_campaign_id"]
+        ).reset_index(drop=True)
 
-        df = pd.DataFrame(campaigns_list)
-        if not df.empty:
-            df = df.drop_duplicates(subset=["business_id", "external_campaign_id"]).reset_index(drop=True)
-        return df
-
-    def transform_daily_insights(
+    def transform_insights(
         self,
-        raw_insights: Union[List[Dict[str, Any]], Generator[Dict[str, Any], None, None]],
+        raw_insights: Any,
+        *,
+        level: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Parses Meta daily insights into (campaigns_df, ad_spend_df).
-        Extracts spend, impressions, clicks, pixel purchases, and attributed purchase values.
-        """
-        campaigns_list: List[Dict[str, Any]] = []
-        spend_list: List[Dict[str, Any]] = []
+        """Map campaign-level direct metrics; preserve attributed metrics in raw storage."""
+        self.rejected_records = []
+        if level is not None and level not in {"account", "campaign", "adset", "ad"}:
+            raise ValueError("level must be account, campaign, adset, or ad.")
 
-        # Flatten if generator of pages
-        items: List[Dict[str, Any]] = []
-        if isinstance(raw_insights, list):
-            items = raw_insights
-        else:
-            for page in raw_insights:
-                items.extend(page.get("insights", page.get("data", [])))
-
-        for row in items:
-            ext_camp_id = str(row.get("campaign_id") or "").strip()
-            if not ext_camp_id:
+        spend_rows: List[Dict[str, Any]] = []
+        for insight in self._records(raw_insights, "insight"):
+            campaign_id = _identifier(insight.get("campaign_id"))
+            row_level = level or (
+                "ad" if insight.get("ad_id") else
+                "adset" if insight.get("adset_id") else
+                "campaign" if campaign_id else "account"
+            )
+            if row_level != "campaign":
+                self._reject("insight", campaign_id, "only campaign-level Insights map to core.ad_spend")
                 continue
 
-            camp_name = str(row.get("campaign_name") or f"Campaign {ext_camp_id}").strip()
-            spend_date = str(row.get("date_start") or row.get("date_stop") or "").strip()
-
-            # Ensure spend_date is valid date format
-            if not spend_date:
-                continue
+            raw_date = insight.get("date_start")
             try:
-                # Validate format YYYY-MM-DD
-                datetime.strptime(spend_date, "%Y-%m-%d")
-            except ValueError:
+                spend_date = normalize_date(raw_date)
+            except (TypeError, ValueError):
+                spend_date = None
+            spend_amount = parse_meta_money(insight.get("spend"))
+            impressions = parse_meta_int(insight.get("impressions"))
+            clicks = parse_meta_int(insight.get("clicks"))
+            if (
+                not campaign_id
+                or not isinstance(spend_date, date)
+                or spend_amount is None
+                or impressions is None
+                or clicks is None
+            ):
+                self._reject(
+                    "insight",
+                    campaign_id,
+                    "missing or malformed campaign_id, date_start, spend, impressions, or clicks",
+                )
                 continue
 
-            spend_amount = parse_meta_money(row.get("spend"))
-            impressions = parse_meta_int(row.get("impressions"))
-            clicks = parse_meta_int(row.get("clicks"))
-
-            # Extract purchases count across Meta conversion action types
-            purchases = 0
-            for action in row.get("actions", []) or []:
-                if action.get("action_type") in PURCHASE_ACTION_TYPES:
-                    purchases = max(purchases, parse_meta_int(action.get("value")))
-
-            # Extract attributed revenue across Meta conversion value types
-            purchase_val = 0.0
-            for val in row.get("action_values", []) or []:
-                if val.get("action_type") in PURCHASE_ACTION_TYPES:
-                    purchase_val = max(purchase_val, parse_meta_money(val.get("value")))
-
-            campaigns_list.append({
+            spend_rows.append({
                 "business_id": self.business_id,
-                "external_campaign_id": ext_camp_id,
-                "campaign_name": camp_name,
-                "campaign_status": "active",
-            })
-
-            spend_list.append({
-                "business_id": self.business_id,
-                "external_campaign_id": ext_camp_id,
+                "external_campaign_id": campaign_id,
                 "spend_date": spend_date,
                 "spend_amount": spend_amount,
                 "impressions": impressions,
                 "clicks": clicks,
-                "purchases": purchases,
-                "purchase_value": purchase_val,
             })
 
-        df_c = (
-            pd.DataFrame(campaigns_list).drop_duplicates(subset=["business_id", "external_campaign_id"]).reset_index(drop=True)
-            if campaigns_list
-            else pd.DataFrame()
-        )
-        df_s = (
-            pd.DataFrame(spend_list).drop_duplicates(subset=["business_id", "external_campaign_id", "spend_date"]).reset_index(drop=True)
-            if spend_list
-            else pd.DataFrame()
-        )
+        empty_campaigns = pd.DataFrame(columns=_CAMPAIGN_COLUMNS)
+        spend_frame = pd.DataFrame(spend_rows, columns=_SPEND_COLUMNS).drop_duplicates(
+            subset=["business_id", "external_campaign_id", "spend_date"]
+        ).reset_index(drop=True)
+        return empty_campaigns, spend_frame
 
-        return df_c, df_s
+    def transform_daily_insights(self, raw_insights: Any) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Backward-compatible campaign-level Insights transformation entry point."""
+        return self.transform_insights(raw_insights, level="campaign")
 

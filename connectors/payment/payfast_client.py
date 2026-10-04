@@ -9,30 +9,32 @@ This client provides:
 1. A CSV parser for PayFast/EasyPaisa merchant settlement exports
 2. A generic template for future webhook or API integration
 
-PayFast CSV export columns (typical):
-transaction_id, order_id, datetime, type, amount, status, fee, description
+Canonical CSV input fields include provider_account_identifier, currency, and
+gateway_fee when those facts are explicitly verified in the source.
 """
 import csv
 import io
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Sequence
 
 class PayFastCSVParser:
     """
     Parses a PayFast / EasyPaisa merchant settlement CSV export file.
     """
 
-    # Map column names from the CSV to our internal standard keys
     COLUMN_MAP = {
-        "transaction_id": ["transaction_id", "txn_id", "txnid", "Transaction ID"],
-        "order_id":       ["order_id", "order_ref", "orderid", "Order ID", "Reference"],
-        "amount":         ["amount", "Amount", "total"],
-        "fee":            ["fee", "Fee", "gateway_fee", "charges"],
-        "status":         ["status", "Status", "payment_status"],
-        "type":           ["type", "Type", "txn_type", "transaction_type"],
-        "paid_at":        ["datetime", "date", "Date", "created_at", "Timestamp"],
+        "external_payment_id": ["external_payment_id"],
+        "external_order_id": ["external_order_id"],
+        "amount": ["amount"],
+        "gateway_fee": ["gateway_fee"],
+        "payment_status": ["payment_status"],
+        "payment_type": ["payment_type"],
+        "payment_method": ["payment_method"],
+        "paid_at": ["paid_at"],
+        "currency": ["currency"],
+        "provider_account_identifier": ["provider_account_identifier"],
     }
 
-    def _resolve_column(self, headers: List[str], aliases: List[str]) -> str | None:
+    def _resolve_column(self, headers: Sequence[str], aliases: List[str]) -> str | None:
         for alias in aliases:
             if alias in headers:
                 return alias
@@ -53,13 +55,18 @@ class PayFastCSVParser:
         records = []
         for row in reader:
             records.append({
-                "gateway_name":        gateway_name,
-                "external_payment_id": row.get(col_map["transaction_id"], "").strip(),
-                "external_order_id":   row.get(col_map["order_id"], "").strip(),
-                "amount":              row.get(col_map["amount"], "0").replace(",", "").strip(),
-                "gateway_fee":         row.get(col_map["fee"], "0").replace(",", "").strip(),
-                "payment_status":      row.get(col_map["status"], "paid").strip(),
-                "payment_type":        row.get(col_map["type"], "payment").strip(),
-                "paid_at":             row.get(col_map["paid_at"], "").strip(),
+                "provider": gateway_name,
+                "external_payment_id": (row.get(col_map["external_payment_id"]) or "").strip() or None,
+                "external_order_id":   (row.get(col_map["external_order_id"]) or "").strip() or None,
+                "amount":              (row.get(col_map["amount"]) or "").replace(",", "").strip() or None,
+                "gateway_fee":         (row.get(col_map["gateway_fee"]) or "").replace(",", "").strip() or None,
+                "payment_status":      (row.get(col_map["payment_status"]) or "").strip() or None,
+                "payment_type":        (row.get(col_map["payment_type"]) or "").strip() or None,
+                "payment_method":      (row.get(col_map["payment_method"]) or "").strip() or None,
+                "paid_at":             (row.get(col_map["paid_at"]) or "").strip() or None,
+                "currency":            (row.get(col_map["currency"]) or "").strip() or None,
+                "provider_account_identifier": (
+                    row.get(col_map["provider_account_identifier"]) or ""
+                ).strip() or None,
             })
         return records

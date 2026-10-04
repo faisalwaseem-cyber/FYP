@@ -1,5 +1,81 @@
+import hashlib
 import re
-from typing import Optional
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Optional
+
+
+def normalize_money(value: Any) -> Decimal:
+    """Return a non-negative NUMERIC(12,2)-ready decimal value."""
+    if value is None or str(value).strip() == "":
+        return Decimal("0.00")
+    try:
+        amount = Decimal(str(value).strip().replace(",", ""))
+        if not amount.is_finite():
+            return Decimal("0.00")
+        if amount < 0:
+            return Decimal("0.00")
+        return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return Decimal("0.00")
+
+
+def normalize_currency_code(value: Any, default: str = "PKR") -> str:
+    """Normalize an ISO 4217 alphabetic currency code for CHAR(3)."""
+    if value is None or str(value).strip() == "":
+        return default
+    code = str(value).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        raise ValueError(f"Invalid currency code: {value!r}")
+    return code
+
+
+def normalize_timestamp(value: Any) -> Optional[datetime]:
+    """Return an aware UTC datetime suitable for a TIMESTAMPTZ column."""
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if raw.endswith(("Z", "z")):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"Invalid timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_date(value: Any) -> Optional[date]:
+    """Return a Python date suitable for a DATE column."""
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        timestamp = normalize_timestamp(value)
+        return timestamp.date() if timestamp else None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"Invalid date: {value!r}") from exc
+
+
+def normalize_location(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    clean = str(value).strip()
+    return clean or None
+
+
+def synthetic_pakistan_phone(namespace: str, identifier: Any) -> str:
+    """Create a stable, valid Pakistan phone proxy for records without a phone."""
+    stable_key = f"{namespace}:{identifier}".encode("utf-8")
+    digits = f"{int(hashlib.sha256(stable_key).hexdigest(), 16) % 1_000_000_000:09d}"
+    return f"+923{digits}"
 
 def normalize_pakistan_phone(phone: Optional[str]) -> Optional[str]:
     """
@@ -35,13 +111,18 @@ def normalize_order_status(shopify_order: dict) -> str:
     if shopify_order.get("cancelled_at") is not None:
         return "cancelled"
 
+    financial_status = str(shopify_order.get("financial_status") or "").lower()
+    if financial_status in ("refunded", "partially_refunded"):
+        return "returned"
+    if financial_status == "voided":
+        return "cancelled"
+
     fulfillment_status = shopify_order.get("fulfillment_status")
     if fulfillment_status == "fulfilled":
         return "fulfilled"
     elif fulfillment_status == "partial":
         return "confirmed"
 
-    financial_status = shopify_order.get("financial_status")
     if financial_status in ("paid", "authorized"):
         return "confirmed"
 

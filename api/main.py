@@ -14,16 +14,25 @@ Backward-compatible routes:
 - GET  /auth/shopify/callback
 - POST /api/sync/shopify
 """
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from api.dependencies import get_current_business_id
 from auth.connection_service import (
     create_or_update_connection,
     list_connections,
     update_status,
+)
+from auth.meta_oauth import (
+    MetaOAuthError,
+    build_meta_authorization_url,
+    exchange_meta_authorization_code,
+    fetch_meta_accessible_ad_accounts,
 )
 from auth.shopify_oauth import (
     build_authorization_url,
@@ -34,12 +43,20 @@ from auth.shopify_oauth import (
     verify_shopify_hmac,
 )
 from auth.token_manager import save_initial_store_connection
+from config.settings import BRIDGE_FLOW_FRONTEND_ORIGIN, META_OAUTH_SCOPES
 from pipeline.run_shopify_sync import run_shopify_sync
+from pipeline.run_meta_ads_sync import run_meta_ads_sync
 
 app = FastAPI(
     title="BRIDGE FLOW Backend API",
     description="Multi-Tenant E-Commerce Intelligence Platform Backend",
     version="1.0.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[BRIDGE_FLOW_FRONTEND_ORIGIN],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -52,6 +69,25 @@ def health_check():
 # 1. Connect / Login Endpoints
 # ---------------------------------------------------------------------------
 
+def _shopify_authorization_url(shop: str, business_id: int) -> str:
+    try:
+        clean_shop = sanitize_shop_domain(shop)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    state = generate_signed_oauth_state(business_id)
+    return build_authorization_url(clean_shop, state)
+
+
+def _shopify_frontend_redirect(outcome: str, reason: Optional[str] = None) -> RedirectResponse:
+    query = {"shopify": outcome}
+    if reason:
+        query["reason"] = reason
+    return RedirectResponse(
+        url=f"{BRIDGE_FLOW_FRONTEND_ORIGIN}/?{urlencode(query)}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
 @app.get("/integrations/shopify/connect")
 @app.get("/auth/shopify/login")
 def shopify_connect(
@@ -62,18 +98,17 @@ def shopify_connect(
     Initiates the Shopify OAuth 2.0 flow for the authenticated business.
     business_id is determined server-side from the authenticated session.
     """
-    try:
-        clean_shop = sanitize_shop_domain(shop)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-    # Generate secure random nonce bound to this business_id in core.oauth_state
-    state = generate_signed_oauth_state(business_id)
-
-    # Build Shopify authorization URL
-    auth_url = build_authorization_url(clean_shop, state)
-
+    auth_url = _shopify_authorization_url(shop, business_id)
     return RedirectResponse(url=auth_url, status_code=status.HTTP_302_FOUND)
+
+
+@app.post("/integrations/shopify/connect")
+def shopify_connect_start(
+    shop: str = Query(..., description="Target Shopify store domain (e.g. my-store.myshopify.com)"),
+    business_id: int = Depends(get_current_business_id),
+):
+    """Returns an authenticated Shopify authorization URL for browser navigation."""
+    return {"authorization_url": _shopify_authorization_url(shop, business_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -96,36 +131,34 @@ def shopify_callback(request: Request):
     state = params.get("state")
 
     if not shop or not code or not state:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required query parameters: 'shop', 'code', or 'state'.",
-        )
+        return _shopify_frontend_redirect("error", "invalid_request")
 
     # 1. Timing-safe HMAC verification
-    if not verify_shopify_hmac(params):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid HMAC signature: Request may have been tampered with.",
-        )
+    try:
+        valid_hmac = verify_shopify_hmac(params)
+    except Exception:
+        valid_hmac = False
+    if not valid_hmac:
+        return _shopify_frontend_redirect("error", "invalid_hmac")
 
     # 2. State verification & business_id resolution (consumed once)
-    business_id = verify_oauth_state(state)
+    try:
+        business_id = verify_oauth_state(state)
+    except Exception:
+        business_id = None
     if not business_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or expired OAuth state nonce. Please initiate authorization again.",
-        )
+        return _shopify_frontend_redirect("error", "invalid_state")
 
-    clean_shop = sanitize_shop_domain(shop)
+    try:
+        clean_shop = sanitize_shop_domain(shop)
+    except ValueError:
+        return _shopify_frontend_redirect("error", "invalid_shop")
 
     # 3. Server-to-server code exchange for expiring offline tokens
     try:
         token_response = exchange_authorization_code(clean_shop, code)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Shopify token exchange failed: {e}",
-        )
+    except Exception:
+        return _shopify_frontend_redirect("error", "token_exchange_failed")
 
     access_token = token_response.get("access_token")
     scopes = token_response.get("scope", "")
@@ -134,25 +167,25 @@ def shopify_callback(request: Request):
     rt_expires_in = token_response.get("refresh_token_expires_in")
 
     if not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Shopify response did not contain an access_token.",
-        )
+        return _shopify_frontend_redirect("error", "token_exchange_failed")
 
     # 4. Authoritative storage in core.platform_connection via ConnectionService
-    conn_id = create_or_update_connection(
-        business_id=business_id,
-        platform="shopify",
-        platform_category="ecommerce",
-        account_identifier=clean_shop,
-        account_name=clean_shop,
-        auth_type="oauth2",
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=expires_in,
-        refresh_token_expires_in=rt_expires_in,
-        scopes=scopes,
-    )
+    try:
+        create_or_update_connection(
+            business_id=business_id,
+            platform="shopify",
+            platform_category="ecommerce",
+            account_identifier=clean_shop,
+            account_name=clean_shop,
+            auth_type="oauth2",
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+            refresh_token_expires_in=rt_expires_in,
+            scopes=scopes,
+        )
+    except Exception:
+        return _shopify_frontend_redirect("error", "connection_storage_failed")
 
     # Dual-write to legacy core.store_connection for backward-compatibility with older tests
     try:
@@ -168,14 +201,7 @@ def shopify_callback(request: Request):
     except Exception:
         pass
 
-    return JSONResponse(content={
-        "status": "success",
-        "message": "Shopify store successfully connected.",
-        "connection_id": conn_id,
-        "business_id": business_id,
-        "store_domain": clean_shop,
-        "scopes": scopes,
-    })
+    return _shopify_frontend_redirect("connected")
 
 
 # ---------------------------------------------------------------------------
@@ -265,3 +291,169 @@ def trigger_shopify_sync(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Shopify sync failed: {e}",
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Meta Ads OAuth and ingestion endpoints
+# ---------------------------------------------------------------------------
+
+def _meta_frontend_redirect(outcome: str, reason: Optional[str] = None, accounts: Optional[int] = None):
+    query = {"meta": outcome}
+    if reason:
+        query["reason"] = reason
+    if accounts is not None:
+        query["accounts"] = str(accounts)
+    return RedirectResponse(
+        url=f"{BRIDGE_FLOW_FRONTEND_ORIGIN}/?{urlencode(query)}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/integrations/meta/connect")
+def meta_connect(business_id: int = Depends(get_current_business_id)):
+    """Return a server-built OAuth URL for browser navigation after authenticated fetch."""
+    try:
+        state_nonce = generate_signed_oauth_state(
+            business_id,
+            platform="meta_ads",
+        )
+        authorization_url = build_meta_authorization_url(state_nonce)
+    except MetaOAuthError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Meta OAuth is not configured.",
+        ) from None
+    return {"authorization_url": authorization_url}
+
+
+@app.get("/integrations/meta/callback")
+def meta_callback(request: Request):
+    """Consume a tenant-bound state, exchange the code, and encrypt per-account tokens."""
+    params = request.query_params
+    state_nonce = params.get("state")
+    if not state_nonce:
+        return _meta_frontend_redirect("error", "invalid_state")
+
+    try:
+        business_id = verify_oauth_state(state_nonce, platform="meta_ads")
+    except Exception:
+        business_id = None
+    if business_id is None:
+        return _meta_frontend_redirect("error", "invalid_state")
+
+    if params.get("error"):
+        return _meta_frontend_redirect("error", "authorization_denied")
+    code = params.get("code")
+    if not code:
+        return _meta_frontend_redirect("error", "invalid_request")
+
+    try:
+        token_data = exchange_meta_authorization_code(code)
+        access_token = token_data["access_token"]
+        accounts = fetch_meta_accessible_ad_accounts(business_id, access_token)
+    except Exception:
+        return _meta_frontend_redirect("error", "authorization_failed")
+
+    connected_account_ids = set()
+    for account in accounts:
+        account_identifier = account.get("id")
+        if (
+            not isinstance(account_identifier, str)
+            or re.fullmatch(r"act_[0-9]+", account_identifier) is None
+            or account_identifier in connected_account_ids
+        ):
+            continue
+        try:
+            create_or_update_connection(
+                business_id=business_id,
+                platform="meta_ads",
+                platform_category="marketing",
+                account_identifier=account_identifier,
+                account_name=account.get("name") if isinstance(account.get("name"), str) else None,
+                auth_type="oauth2",
+                access_token=access_token,
+                expires_in=token_data.get("expires_in"),
+                scopes=META_OAUTH_SCOPES,
+            )
+        except Exception:
+            return _meta_frontend_redirect("error", "connection_storage_failed")
+        connected_account_ids.add(account_identifier)
+
+    if not connected_account_ids:
+        return _meta_frontend_redirect("error", "no_accessible_ad_accounts")
+    return _meta_frontend_redirect("connected", accounts=len(connected_account_ids))
+
+
+@app.get("/integrations/meta/status")
+def meta_status(business_id: int = Depends(get_current_business_id)):
+    """Return safe connection metadata for all Meta accounts owned by this tenant."""
+    connections = [
+        connection
+        for connection in list_connections(business_id)
+        if connection["platform"] == "meta_ads"
+    ]
+    accounts = []
+    for connection in connections:
+        accounts.append({
+            "account_identifier": connection["account_identifier"],
+            "account_name": connection.get("account_name"),
+            "status": connection["status"],
+            "scopes": connection.get("scopes"),
+            "installed_at": connection["installed_at"].isoformat()
+            if connection.get("installed_at") else None,
+            "last_synced_at": connection["last_synced_at"].isoformat()
+            if connection.get("last_synced_at") else None,
+        })
+    return {
+        "connected": any(account["status"] == "active" for account in accounts),
+        "platform": "meta_ads",
+        "accounts": accounts,
+    }
+
+
+@app.post("/integrations/meta/disconnect")
+def meta_disconnect(
+    account_identifier: Optional[str] = Query(None),
+    business_id: int = Depends(get_current_business_id),
+):
+    """Disconnect one selected account or all Meta accounts within the authenticated tenant."""
+    connections = [
+        connection
+        for connection in list_connections(business_id)
+        if connection["platform"] == "meta_ads"
+        and (account_identifier is None or connection["account_identifier"] == account_identifier)
+    ]
+    if not connections:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No matching Meta ad account connection was found.",
+        )
+    for connection in connections:
+        update_status(connection["connection_id"], "disconnected")
+    return {"status": "disconnected", "accounts_disconnected": len(connections)}
+
+
+@app.post("/integrations/meta/sync")
+def trigger_meta_sync(
+    account_identifier: Optional[str] = Query(None),
+    days_back: int = Query(7, ge=1, le=90),
+    business_id: int = Depends(get_current_business_id),
+):
+    """Sync one selected or all active Meta ad accounts for the authenticated business."""
+    try:
+        result = run_meta_ads_sync(
+            business_id=business_id,
+            days_back=days_back,
+            account_identifier=account_identifier,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from None
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Meta Ads synchronization failed.",
+        ) from None
+    return result

@@ -70,7 +70,7 @@ Validation / edge cases
 """
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -289,7 +289,7 @@ class TestPostExTransformer(unittest.TestCase):
                             "bookingDate": "2026-09-25T08:00:00+05:00"}}
         result = self.t.transform_shipment("postex", payload)
         self.assertIsNotNone(result["shipped_at"])
-        self.assertIn("2026-09-25", result["shipped_at"])
+        self.assertEqual(result["shipped_at"], datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc))
 
     def test_delivered_at_set_when_status_delivered(self):
         payload = {"dist": {"trackingNumber": "TN-007", "orderRefNumber": "REF-007",
@@ -366,8 +366,8 @@ class TestTraxTransformer(unittest.TestCase):
                    "pickup_date": "2026-09-26T08:00:00+05:00",
                    "delivery_date": "2026-09-30T12:00:00+05:00"}
         result = self.t.transform_shipment("trax", payload)
-        self.assertIn("2026-09-26", result["shipped_at"])
-        self.assertIn("2026-09-30", result["delivered_at"])
+        self.assertEqual(result["shipped_at"], datetime(2026, 9, 26, 3, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["delivered_at"], datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc))
 
 
 class TestLeopardsTransformer(unittest.TestCase):
@@ -583,13 +583,10 @@ class TestRTORecordBuilder(unittest.TestCase):
     # 31. return_date is a valid non-empty ISO 8601 string
     # ------------------------------------------------------------------
 
-    def test_return_date_is_iso8601_string(self):
+    def test_return_date_is_aware_datetime(self):
         rto = self.t.build_rto_record(self.shipment)
-        self.assertIsInstance(rto["return_date"], str)
-        self.assertTrue(len(rto["return_date"]) > 0)
-        # Must be parseable as ISO 8601
-        dt = datetime.fromisoformat(rto["return_date"].replace("Z", "+00:00"))
-        self.assertIsNotNone(dt)
+        self.assertIsInstance(rto["return_date"], datetime)
+        self.assertEqual(rto["return_date"].tzinfo, timezone.utc)
 
 
 class TestCODSettlementTransformer(unittest.TestCase):

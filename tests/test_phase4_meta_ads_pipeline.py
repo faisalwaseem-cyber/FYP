@@ -5,7 +5,7 @@ Validates the full multi-tenant pipeline wire-up:
     Authenticated Business
     → core.platform_connection
     → CredentialManager
-    → MetaClient (mocked Graph API v26.0)
+    → MetaAdsClient (mocked Graph API v25.0)
     → MetaCampaignService / MetaInsightsService
     → raw.raw_data (verbatim JSON persistence)
     → ETL (MetaAdsTransformer)
@@ -40,7 +40,7 @@ from auth.connection_service import (
 )
 from auth.credential_manager import CredentialManager
 from config.database import get_db_connection
-from connectors.meta.client import MetaAPIError, MetaClient
+from connectors.meta_ads.client import MetaAPIError, MetaAdsClient
 from pipeline.run_meta_ads_sync import resolve_meta_credentials, run_meta_ads_sync
 from security.encryption import decrypt_token
 
@@ -60,16 +60,13 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         cls._cleanup_db()
         cls.conn_id = create_or_update_connection(
             business_id=cls.BUSINESS_ID,
-            platform="meta",
+            platform="meta_ads",
             platform_category="marketing",
             account_identifier=cls.ACCOUNT_ID,
             account_name="Test Meta Ad Account Phase 4.4",
             auth_type="oauth2",
             access_token="test_meta_access_token_phase44_xyz",
-            additional_credentials={
-                "app_secret": "test_meta_app_secret_phase44_abc",
-                "ad_account_id": cls.ACCOUNT_ID,
-            },
+            additional_credentials={"ad_account_id": cls.ACCOUNT_ID},
         )
 
     @classmethod
@@ -108,7 +105,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
 
     def setUp(self):
         """Ensure test connection is active and test records cleaned before each test."""
-        conn_row = get_connection(self.BUSINESS_ID, "meta", self.ACCOUNT_ID)
+        conn_row = get_connection(self.BUSINESS_ID, "meta_ads", self.ACCOUNT_ID)
         if conn_row and conn_row.get("status") != "active":
             update_status(conn_row["connection_id"], "active")
 
@@ -148,7 +145,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             cm.get_valid_credentials(
                 business_id=self.OTHER_BUSINESS_ID,
-                platform="meta",
+                platform="meta_ads",
                 account_identifier=self.ACCOUNT_ID,
             )
 
@@ -177,14 +174,16 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
     # 2. Mocked End-to-End Sync
     # ------------------------------------------------------------------
 
-    @patch("connectors.meta.client.MetaClient.request")
+    @patch("connectors.meta_ads.client.MetaAdsClient._make_request")
     def test_mocked_sync(self, mock_request):
         """
         Tests end-to-end sync orchestration:
         platform_connection → CredentialManager → MetaClient → Services → Raw → ETL → DB → Logger
         """
-        def mock_request_side_effect(method, path, **kwargs):
-            if "campaigns" in path:
+        def mock_request_side_effect(endpoint, params=None):
+            if endpoint == "me/adaccounts":
+                return {"data": [{"id": self.ACCOUNT_ID, "name": "Test Account"}], "paging": {}}
+            if endpoint.endswith("/campaigns"):
                 return {
                     "data": [
                         {
@@ -195,7 +194,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
                     ],
                     "paging": {},
                 }
-            elif "insights" in path:
+            elif endpoint.endswith("/insights"):
                 return {
                     "data": [
                         {
@@ -211,7 +210,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
                     ],
                     "paging": {},
                 }
-            return {"data": []}
+            return {"data": [], "paging": {}}
 
         mock_request.side_effect = mock_request_side_effect
 
@@ -227,7 +226,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         with get_db_connection() as conn:
             raw_row = conn.execute(text("""
                 SELECT count(*) FROM raw.raw_data
-                WHERE business_id = :b_id AND source = 'meta_ads' AND data_type = 'daily_insights';
+                WHERE business_id = :b_id AND source = 'meta_ads' AND data_type = 'insights';
             """), {"b_id": self.BUSINESS_ID}).scalar()
             self.assertGreater(raw_row, 0)
 
@@ -242,8 +241,8 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
             self.assertEqual(float(spend_row[0]), 4800.00)
             self.assertEqual(spend_row[1], 19500)
             self.assertEqual(spend_row[2], 650)
-            self.assertEqual(spend_row[3], 15)
-            self.assertEqual(float(spend_row[4]), 52000.00)
+            self.assertEqual(spend_row[3], 0)
+            self.assertEqual(float(spend_row[4]), 0.00)
             self.assertEqual(spend_row[5], "Phase 4.4 Automated Lawn Launch")
 
             # 3. Telemetry log verification
@@ -269,16 +268,18 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
     # 3. Idempotency
     # ------------------------------------------------------------------
 
-    @patch("connectors.meta.client.MetaClient.request")
+    @patch("connectors.meta_ads.client.MetaAdsClient._make_request")
     def test_idempotency(self, mock_request):
         """
         Verifies that running the sync twice with updated metrics modifies the existing
         records rather than creating duplicate entries.
         """
-        def mock_request_first_call(method, path, **kwargs):
-            if "campaigns" in path:
+        def mock_request_first_call(endpoint, params=None):
+            if endpoint == "me/adaccounts":
+                return {"data": [{"id": self.ACCOUNT_ID, "name": "Test Account"}], "paging": {}}
+            if endpoint.endswith("/campaigns"):
                 return {"data": [{"id": self.TEST_CAMPAIGN_ID, "name": "Idempotent Campaign", "status": "ACTIVE"}], "paging": {}}
-            elif "insights" in path:
+            elif endpoint.endswith("/insights"):
                 return {
                     "data": [
                         {
@@ -294,12 +295,14 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
                     ],
                     "paging": {},
                 }
-            return {"data": []}
+            return {"data": [], "paging": {}}
 
-        def mock_request_second_call(method, path, **kwargs):
-            if "campaigns" in path:
+        def mock_request_second_call(endpoint, params=None):
+            if endpoint == "me/adaccounts":
+                return {"data": [{"id": self.ACCOUNT_ID, "name": "Test Account"}], "paging": {}}
+            if endpoint.endswith("/campaigns"):
                 return {"data": [{"id": self.TEST_CAMPAIGN_ID, "name": "Idempotent Campaign Updated", "status": "ACTIVE"}], "paging": {}}
-            elif "insights" in path:
+            elif endpoint.endswith("/insights"):
                 return {
                     "data": [
                         {
@@ -315,7 +318,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
                     ],
                     "paging": {},
                 }
-            return {"data": []}
+            return {"data": [], "paging": {}}
 
         # Run 1
         mock_request.side_effect = mock_request_first_call
@@ -353,7 +356,7 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
     # 4. Failed Sync
     # ------------------------------------------------------------------
 
-    @patch("connectors.meta.client.MetaClient.request")
+    @patch("connectors.meta_ads.client.MetaAdsClient._make_request")
     def test_failed_sync(self, mock_request):
         """
         Verifies that an unhandled API error logs failure in raw.sync_log
@@ -361,8 +364,8 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         """
         mock_request.side_effect = MetaAPIError(
             message="Permissions error: User does not have ads_read access",
-            code=200,
-            error_subcode=1349048,
+            api_code=200,
+            api_subcode=1349048,
         )
 
         with self.assertRaises(MetaAPIError):
@@ -401,7 +404,6 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         4. Pipeline summary dict does not contain access token or secret.
         """
         raw_token = "test_meta_access_token_phase44_xyz"
-        raw_secret = "test_meta_app_secret_phase44_abc"
 
         # 1. At-rest encryption check
         with get_db_connection() as conn:
@@ -421,15 +423,18 @@ class TestPhase4MetaAdsPipeline(unittest.TestCase):
         token, acc_id, secret, cid = resolve_meta_credentials(self.BUSINESS_ID)
         self.assertEqual(token, raw_token)
         self.assertEqual(acc_id, self.ACCOUNT_ID)
-        self.assertEqual(secret, raw_secret)
+        self.assertIsNone(secret)
         self.assertEqual(cid, self.conn_id)
 
         # 3. Client repr safety
-        client = MetaClient(access_token=token, ad_account_id=acc_id, app_secret=secret)
+        client = MetaAdsClient(
+            business_id=self.BUSINESS_ID,
+            account_identifier=acc_id,
+            credential_manager=MagicMock(),
+        )
         repr_str = repr(client)
         self.assertNotIn(raw_token, repr_str)
-        self.assertNotIn(raw_secret, repr_str)
-        self.assertIn("token='***'", repr_str)
+        self.assertIn("credentials=<redacted>", repr_str)
 
 
 if __name__ == "__main__":

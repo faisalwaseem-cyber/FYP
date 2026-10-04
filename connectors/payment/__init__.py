@@ -3,7 +3,7 @@ Payment and Settlement Foundation — BRIDGE FLOW Phase 6
 =======================================================
 
 Exports:
-- BasePaymentProvider, PaymentRecord, SettlementBatch
+- BasePaymentProvider, PaymentRecord, PaymentSettlement, PaymentSettlementEntry
 - Provider implementations: Stripe, PayFast, JazzCash, EasyPaisa, COD, Manual
 - Provider factory: get_payment_provider
 """
@@ -11,10 +11,12 @@ from connectors.payment.base import (
     VALID_PAYMENT_METHODS,
     VALID_PAYMENT_STATUSES,
     VALID_PAYMENT_TYPES,
+    VALID_SETTLEMENT_ENTRY_TYPES,
     VALID_SETTLEMENT_STATUSES,
     BasePaymentProvider,
     PaymentRecord,
-    SettlementBatch,
+    PaymentSettlement,
+    PaymentSettlementEntry,
     normalize_method,
     normalize_status,
     normalize_type,
@@ -32,11 +34,13 @@ __all__ = [
     # Base abstraction & data models
     "BasePaymentProvider",
     "PaymentRecord",
-    "SettlementBatch",
+    "PaymentSettlement",
+    "PaymentSettlementEntry",
     # Enums & normalizers
     "VALID_PAYMENT_METHODS",
     "VALID_PAYMENT_STATUSES",
     "VALID_PAYMENT_TYPES",
+    "VALID_SETTLEMENT_ENTRY_TYPES",
     "VALID_SETTLEMENT_STATUSES",
     "normalize_method",
     "normalize_status",
@@ -52,4 +56,3 @@ __all__ = [
     # Factory
     "get_payment_provider",
 ]
-

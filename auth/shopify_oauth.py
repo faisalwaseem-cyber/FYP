@@ -55,7 +55,12 @@ def sanitize_shop_domain(shop: str) -> str:
     return cleaned
 
 
-def generate_signed_oauth_state(business_id: int, ttl_minutes: int = 15) -> str:
+def generate_signed_oauth_state(
+    business_id: int,
+    ttl_minutes: int = 15,
+    *,
+    platform: str = "shopify",
+) -> str:
     """
     Generates a cryptographically secure random state nonce, binds it to the
     authenticated business_id in core.oauth_state, and returns the state token.
@@ -71,18 +76,27 @@ def generate_signed_oauth_state(business_id: int, ttl_minutes: int = 15) -> str:
 
     insert_sql = text("""
         INSERT INTO core.oauth_state (business_id, state_nonce, platform, created_at, expires_at)
-        VALUES (:b_id, :nonce, 'shopify', now(), now() + (:ttl || ' minutes')::INTERVAL);
+        VALUES (:b_id, :nonce, :platform, now(), now() + (:ttl || ' minutes')::INTERVAL);
     """)
 
     with get_db_connection() as conn:
         conn.execute(cleanup_sql)
-        conn.execute(insert_sql, {"b_id": business_id, "nonce": nonce, "ttl": str(ttl_minutes)})
+        conn.execute(insert_sql, {
+            "b_id": business_id,
+            "nonce": nonce,
+            "platform": platform,
+            "ttl": str(ttl_minutes),
+        })
         conn.commit()
 
     return nonce
 
 
-def verify_oauth_state(state_nonce: str) -> Optional[int]:
+def verify_oauth_state(
+    state_nonce: str,
+    *,
+    platform: str = "shopify",
+) -> Optional[int]:
     """
     Verifies that the state nonce exists in core.oauth_state and has not expired.
     Deletes the used state nonce to prevent replay/CSRF attacks.
@@ -91,27 +105,23 @@ def verify_oauth_state(state_nonce: str) -> Optional[int]:
     if not state_nonce:
         return None
 
-    select_sql = text("""
-        SELECT business_id, expires_at
-        FROM core.oauth_state
-        WHERE state_nonce = :nonce AND platform = 'shopify' AND expires_at > now();
-    """)
-
-    delete_sql = text("""
+    consume_sql = text("""
         DELETE FROM core.oauth_state
-        WHERE state_nonce = :nonce AND platform = 'shopify';
+        WHERE state_nonce = :nonce
+          AND platform = :platform
+          AND expires_at > now()
+        RETURNING business_id;
     """)
 
     with get_db_connection() as conn:
-        result = conn.execute(select_sql, {"nonce": state_nonce}).fetchone()
-        if not result:
+        row = conn.execute(consume_sql, {
+            "nonce": state_nonce,
+            "platform": platform,
+        }).fetchone()
+        if row is None:
             return None
-
-        business_id = int(result[0])
-        # Invalidate nonce immediately (single-use)
-        conn.execute(delete_sql, {"nonce": state_nonce})
         conn.commit()
-        return business_id
+        return int(row[0])
 
 
 def build_authorization_url(
